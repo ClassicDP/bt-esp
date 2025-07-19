@@ -19,7 +19,7 @@ fi
 
 # --- Настройки путей ---
 export IDF_PATH="$HOME/esp/esp-idf"
-export IDF_PYTHON_ENV_PATH="$HOME/.espressif/python_env/idf5.2_py3.11_env"
+export IDF_PYTHON_ENV_PATH="$HOME/.espressif/python_env/idf5.2_py3.13_env"
 
 # --- Устанавливаем certifi, если не установлен ---
 if ! "$IDF_PYTHON_ENV_PATH/bin/python" -m pip show certifi >/dev/null 2>&1; then

@@ -1,910 +1,522 @@
 #!/usr/bin/env python3
 """
-Простой сервер для приема и воспроизведения аудиоданных от ESP32
-Поддерживает CVSD и mSBC кодеки
+Minimal audio server:
+- Single TCP client (ESP32).
+- Optional ASCII preamble "AUDIO_STREAM" ending with blank line.
+- Binary packets with header (little-endian):
+    uint32 magic      (0x48445541 'AUDH' or legacy 0x41554448)
+    uint32 seq        (32-bit packet sequence)
+    uint64 timestamp_us (ignored except for presence)
+    uint16 payload_len (PCM payload length)
+    uint16 codec       (1 -> 8000 Hz, 2 -> 16000 Hz) *payload already raw PCM s16le mono*
+- Plays audio via PyAudio.
+- Tracks packet loss (sequence gaps) and prints warnings.
+- Saves rolling WAV files every 5 seconds; cleans old segment_*.wav on start.
 """
 
-
 import socket
-import threading
 import struct
 import time
-import queue
-import pyaudio
-import wave
 import argparse
-import sys
-import numpy as np
-import subprocess
-import tempfile
+import wave
+import queue
+import threading
+import glob
 import os
-
+import sys
 import atexit
+import csv
 
-from collections import deque, Counter
-
-# ---- Stream packet header (must match firmware) ----
-# C struct (little-endian packed):
-# typedef struct {
-#     uint32_t magic;
-#     uint32_t seq;
-#     uint64_t timestamp_us;
-#     uint16_t payload_len;
-#     uint16_t codec;
-# } stream_packet_header_t;
-# NOTE: сервер теперь может автоматически переключаться в raw_frame_mode, если не находит magic
-# RAW fallback disabled – now strict header mode with dual magic acceptance.
+# ---- Protocol constants ----
 STREAM_HEADER_STRUCT = struct.Struct('<IIQHH')
-STREAM_HEADER_SIZE = STREAM_HEADER_STRUCT.size  # 20 bytes
-STREAM_MAGIC_NEW = 0x48445541  # 'AUDH' target magic (bytes: 41 55 44 48)
-STREAM_MAGIC_OLD = 0x41554448  # legacy magic currently sent by ESP (bytes: 48 44 55 41)
-STREAM_MAGIC = STREAM_MAGIC_NEW
-STREAM_CODEC_CVSD = 1
-STREAM_CODEC_MSBC = 2
-
-PCM_FALLBACK_ENABLED = False  # отключаем raw fallback – хотим строгий заголовок
-
-# Helper to pretty-print magic bytes in little-endian order
-def magic_bytes_le(val: int):
-    return ' '.join(f'{b:02X}' for b in val.to_bytes(4, 'little'))
-
-# --- Packet sequence analysis tuning constants ---
-# Предполагаемая частота пакетов: ~60 сэмплов при 8 кГц => ~133 пакета/сек
-PACKETS_PER_SECOND_EST = 133
-MAX_REAL_LOSS_WINDOW_SEC = 2          # считаем реальные потери только в окне 2 сек
-MAX_REASONABLE_GAP = PACKETS_PER_SECOND_EST * MAX_REAL_LOSS_WINDOW_SEC  # ~266
-MAX_ABSOLUTE_GAP = 5000               # жесткая отсечка
-BURST_SUPPRESS_THRESHOLD = 1000       # после пропуска > этого отключаем учет пока не восстановится
-RECOVER_MIN_CONSECUTIVE_OK = 50       # сколько нормальных инкрементов нужно для восстановления учета
-
-class SequenceAnalyzer:
-    """
-    Анализирует «сырые» 4 байта счетчика для авто-определения формата.
-    Пытается:
-      1. Определить endianness (big / little).
-      2. Понять, используются ли только отдельные байты (например 16-битный счетчик внутри 32-битного слова, остальные = 0xFF или 0x00).
-      3. Выявить «шум» / непригодность поля.
-    Пока надежный формат не найден – учет потерь отключен.
-    """
-    def __init__(self, sample_size=64):
-        self.sample_size = sample_size
-        self.samples = deque(maxlen=sample_size)
-        self.format_determined = False
-        self.use_masked_16 = False
-        self.mask_bytes = None      # индексы байт, которые образуют счетчик
-        self.endian = None          # 'big' / 'little'
-        self.unreliable = False
-        self.last_seq = None
-        self.unreliable_warns = 0
-        self.max_unreliable_warns = 5  # ограничим число повторяющихся сообщений
-
-    def add(self, raw4: bytes):
-        if len(raw4) != 4:
-            return
-        self.samples.append(raw4)
-        if not self.format_determined and len(self.samples) >= self.sample_size//2:
-            self._analyze()
-
-    def _analyze(self):
-        # Быстрая эвристика: если встречались значения вида ?? FF ?? FF или FF ?? FF ??,
-        # попробуем сначала интерпретировать два непостоянных байта, игнорируя стабильно 0xFF.
-        ff_pattern_counts = sum(1 for r in self.samples if r.count(0xFF) >= 2)
-        # Если большинство выборок содержат >=2 байтов 0xFF, усилим гипотезу masked 16-bit
-        if ff_pattern_counts > len(self.samples) * 0.6 and not self.format_determined:
-            # Определим какие байты НЕ 0xFF чаще всего
-            non_ff_positions = []
-            for i in range(4):
-                col = [r[i] for r in self.samples]
-                # Частота не-0xFF
-                non_ff_ratio = sum(1 for b in col if b != 0xFF) / len(col)
-                if non_ff_ratio > 0.2:
-                    non_ff_positions.append(i)
-            if len(non_ff_positions) == 2:
-                self.use_masked_16 = True
-                self.mask_bytes = non_ff_positions
-        # Подсчет разнообразия по каждому байту
-        cols = list(zip(*self.samples))  # 4 списока байтов
-        variances = [len(set(c)) for c in cols]
-
-        # Если 2 байта почти константы (variance ==1) и 2 байта меняются - возможно 16-битный счетчик
-        changing = [i for i,v in enumerate(variances) if v > 1]
-        if len(changing) == 2:
-            self.use_masked_16 = True
-            self.mask_bytes = changing
-        elif len(changing) in (3,4):
-            self.use_masked_16 = False
-        else:
-            # 0 или 1 меняющийся байт -> малый диапазон или мусор
-            self.unreliable = True
-            self.format_determined = True
-            return
-
-        # Проверка endianness: построим последовательности для big и little и оценим «монотонность»
-        def build_seq_big(raw):
-            return int.from_bytes(raw, 'big')
-        def build_seq_little(raw):
-            return int.from_bytes(raw, 'little')
-
-        def build_seq_masked(raw, order):
-            b = raw
-            part = bytes([b[self.mask_bytes[0]], b[self.mask_bytes[1]]])
-            return int.from_bytes(part, order)
-
-        seqs_big = []
-        seqs_little = []
-
-        if self.use_masked_16:
-            for r in self.samples:
-                seqs_big.append(build_seq_masked(r,'big'))
-                seqs_little.append(build_seq_masked(r,'little'))
-        else:
-            for r in self.samples:
-                seqs_big.append(build_seq_big(r))
-                seqs_little.append(build_seq_little(r))
-
-        def monotonic_score(seq_list):
-            """
-            Считает "качество" последовательности:
-            +1 за нормальный маленький инкремент (1..4)
-            0 за нулевой / отрицательный / слишком большой (подозрительный) скачок
-            """
-            good = 0
-            prev = None
-            for v in seq_list:
-                if prev is not None:
-                    d = (v - prev) & 0xFFFFFFFF
-                    if 0 < d <= 4:
-                        good += 1
-                prev = v
-            return good
-
-        score_big = monotonic_score(seqs_big)
-        score_little = monotonic_score(seqs_little)
-        # debug: можно при необходимости вывести score_big/score_little
-        if score_big == 0 and score_little == 0:
-            # пока не сдаёмся — попробуем еще подкопить выборку
-            if len(self.samples) < self.sample_size:
-                return
-            # окончательно признаем ненадёжным
-            self.unreliable = True
-            self.format_determined = True
-            return
-
-        # Выбираем лучший
-        if score_big >= score_little:
-            self.endian = 'big'
-        else:
-            self.endian = 'little'
-
-        self.format_determined = True
-
-    def extract_sequence(self, raw4: bytes):
-        if not self.format_determined or self.unreliable:
-            return None
-        if self.use_masked_16:
-            part = bytes([raw4[self.mask_bytes[0]], raw4[self.mask_bytes[1]]])
-            seq = int.from_bytes(part, self.endian)
-            return seq
-        else:
-            return int.from_bytes(raw4, self.endian)
-
-# --- Packet loss helper ---
-def packet_loss_delta(prev_id, curr_id, bits=32):
-    """
-    Вычисляет пропущенные пакеты с защитой от шумовых скачков.
-    Возвращает (missed, wrapped, valid, noisy_jump)
-
-    noisy_jump=True если скачок явно нереалистичный и должен приводить
-    к временной приостановке учета потерь.
-    """
-    if prev_id is None:
-        return 0, False, False, False
-
-    modulus = 1 << bits
-    prev_u = prev_id % modulus
-    curr_u = curr_id % modulus
-
-    if curr_u == prev_u:
-        return 0, False, True, False  # дубликат
-
-    wrapped = curr_u < prev_u
-    if not wrapped:
-        gap = curr_u - prev_u - 1
-    else:
-        gap = (modulus - prev_u) + curr_u - 1
-
-    if gap < 0:
-        return 0, wrapped, False, True
-
-    # Нереалистичный скачок?
-    if gap > MAX_ABSOLUTE_GAP:
-        return 0, wrapped, False, True
-
-    # Разумный?
-    if gap <= MAX_REASONABLE_GAP:
-        return gap, wrapped, True, False
-
-    # Между MAX_REASONABLE_GAP и MAX_ABSOLUTE_GAP — считаем шумом, но отмечаем
-    return 0, wrapped, False, True
-
-class CVSDDecoder:
-    """CVSD (Continuously Variable Slope Delta) декодер с исправленной логикой для HFP"""
-
-    def __init__(self):
-        # Параметры CVSD специально для Bluetooth HFP
-        self.step_size = 8.0       # Еще меньший начальный шаг
-        self.min_step = 2.0        # Минимальный шаг
-        self.max_step = 128.0      # Максимальный шаг
-        self.step_adaptation = 1.1 # Очень медленная адаптация
-        self.integrator = 0.0      # Интегратор для CVSD
-
-        # Фильтр для сглаживания
-        self.history = [0.0] * 8
-        self.history_index = 0
-
-        # Счетчик одинаковых битов для slope overload
-        self.same_bit_count = 0
-        self.last_bit = None
-
-    def _apply_filter(self, sample):
-        """Применяем простой FIR фильтр низких частот"""
-        self.history[self.history_index] = sample
-        self.history_index = (self.history_index + 1) % len(self.history)
-
-        # Простое усреднение с весами (низкочастотный фильтр)
-        filtered = 0.0
-        weights = [0.2, 0.15, 0.15, 0.1, 0.1, 0.1, 0.1, 0.1]
-        for i, weight in enumerate(weights):
-            idx = (self.history_index - 1 - i) % len(self.history)
-            filtered += self.history[idx] * weight
-
-        return filtered
-
-    def decode(self, encoded_data):
-        """Декодирование CVSD данных в PCM с правильной логикой для HFP"""
-        if not encoded_data:
-            return b''
-
-        # Преобразуем данные в биты - попробуем LSB first (как в оригинале)
-        bits = []
-        for byte in encoded_data:
-            for i in range(8):
-                bits.append((byte >> i) & 1)
-
-        output_samples = []
-
-        for bit in bits:
-            # Отслеживаем повторяющиеся биты для slope overload detection
-            if self.last_bit is not None and bit == self.last_bit:
-                self.same_bit_count += 1
-            else:
-                self.same_bit_count = 0
-            self.last_bit = bit
-
-            # CVSD алгоритм: интегратор + адаптивный шаг
-            if bit == 1:
-                self.integrator += self.step_size
-            else:
-                self.integrator -= self.step_size
-
-            # Ограничиваем выход интегратора
-            self.integrator = max(-8192, min(8192, self.integrator))
-
-            # Применяем фильтр низких частот
-            filtered_output = self._apply_filter(self.integrator)
-
-            # Адаптация размера шага на основе slope overload
-            if self.same_bit_count >= 3:  # Slope overload detected
-                self.step_size = min(self.max_step, self.step_size * self.step_adaptation)
-            else:
-                self.step_size = max(self.min_step, self.step_size / self.step_adaptation)
-
-            # Преобразуем в 16-битный сэмпл
-            sample = int(filtered_output)
-            sample = max(-32767, min(32767, sample))
-            output_samples.append(sample)
-
-        # Конвертируем в байты
-        return struct.pack('<' + 'h' * len(output_samples), *output_samples)
-
-
-class MSBCDecoder:
-    """mSBC (modified SBC) декодер через FFmpeg"""
-
-    def __init__(self):
-        self.ffmpeg_available = self._check_ffmpeg()
-        self.buffer = b''
-
-    def _check_ffmpeg(self):
-        """Проверяем наличие FFmpeg"""
-        try:
-            result = subprocess.run(['ffmpeg', '-version'],
-                                  capture_output=True, text=True, timeout=5)
-            return result.returncode == 0
-        except Exception:
-            return False
-
-    def decode(self, encoded_data):
-        """Декодирование mSBC данных в PCM через FFmpeg"""
-        if not self.ffmpeg_available:
-            print("⚠️ FFmpeg недоступен для декодирования mSBC")
-            return None
-
-        if not encoded_data:
-            return b''
-
-        # Накапливаем данные в буфере
-        self.buffer += encoded_data
-
-        # mSBC фреймы обычно 57 байт, но может варьироваться
-        # Пытаемся декодировать когда накопилось достаточно данных
-        if len(self.buffer) < 114:  # Минимум 2 фрейма
-            return b''
-
-        try:
-            # Создаем временные файлы
-            with tempfile.NamedTemporaryFile(suffix='.sbc', delete=False) as input_file:
-                input_file.write(self.buffer)
-                input_path = input_file.name
-
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as output_file:
-                output_path = output_file.name
-
-            # Декодируем через FFmpeg
-            cmd = [
-                'ffmpeg', '-y', '-f', 'sbc', '-i', input_path,
-                '-f', 's16le', '-ar', '16000', '-ac', '1', output_path
-            ]
-
-            result = subprocess.run(cmd, capture_output=True, timeout=2)
-
-            if result.returncode == 0:
-                # Читаем декодированные данные
-                with open(output_path, 'rb') as f:
-                    decoded_data = f.read()
-
-                # Очищаем буфер
-                self.buffer = b''
-                return decoded_data
-            else:
-                # Если декодирование не удалось, очищаем часть буфера
-                self.buffer = self.buffer[57:]  # Удаляем один предполагаемый фрейм
-                return b''
-
-        except Exception as e:
-            print(f"❌ Ошибка декодирования mSBC: {e}")
-            self.buffer = b''
-            return b''
-        finally:
-            # Удаляем временные файлы
-            try:
-                os.unlink(input_path)
-                os.unlink(output_path)
-            except:
-                pass
-
+STREAM_HEADER_SIZE = STREAM_HEADER_STRUCT.size
+STREAM_MAGIC_NEW = 0x48445541
+STREAM_MAGIC_OLD = 0x41554448
+CODEC_CVSD = 1     # treat as raw 8 kHz PCM
+CODEC_MSBC = 2     # treat as raw 16 kHz PCM
+LOSS_IGNORE_HUGE_GAP = 100000  # ignore gaps >= this (assume reset)
 
 class AudioServer:
-    def __init__(self, host='0.0.0.0', port=12345):
+    def __init__(self, host='0.0.0.0', port=8888, segment_seconds=5):
         self.host = host
         self.port = port
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((self.host, self.port))
-        self.packet_count = 0
-        self.last_packet_id = None
-        self.log_file_path = "packet_log.txt"
-        self.start_time = time.time()
-        self.log_interval = 20  # Интервал записи в секунду
-        self.last_log_time = self.start_time
+        self.segment_seconds = segment_seconds
 
-        # Очищаем файл при запуске
-        with open(self.log_file_path, "w") as f:
-            f.write("")
+        self.running = False
+        self.accept_legacy_magic = True
 
-        # Регистрируем очистку при завершении
-        atexit.register(self.cleanup_logs)
+        # Packet statistics
+        self.total_packets = 0
+        self.missed_packets = 0
+        self.dropped_packets = 0
+        self.last_seq = None
 
-        # Декодеры
-        self.cvsd_decoder = CVSDDecoder()
-        self.msbc_decoder = MSBCDecoder()
+        # Packet control / analysis (minimal)
+        self.expected_seq = None
+        self.dup_packets = 0
+        self.reordered_packets = 0
+        self.gap_events = 0
+        self.max_gap = 0
+        self.packet_log_path = "packet_log.csv"
+        self.packet_log_file = open(self.packet_log_path, "w", newline='')
+        self.packet_csv = csv.writer(self.packet_log_file)
+        self.packet_csv.writerow([
+            "time_s","seq","expected","gap","event",
+            "lost_total","dup_total","reorder_total",
+            "delta_ms","qsize","underrun",
+            "mean","edge_jump","conceal_ins"
+        ])
 
-        # Параметры аудио по умолчанию
+        # Timing / underrun diagnostics
+        self.prev_arrival = None
+        self.avg_delta_ms = 0.0
+        self._curr_delta_ms = 0.0
+        self._curr_qsize = 0
+        self.underrun_events = 0
+
+        # Edge / continuity diagnostics & concealment
+        self.prev_last_sample = None
+        self.edge_jump_threshold = 1500   # int16 threshold for edge detection
+        self._curr_mean = 0
+        self._curr_edge_jump = 0
+        self.inserted_conceal_frames = 0
+        self._gap_conceal_pending = 0
+        self.max_gap_conceal_frames = 20  # limit PLC frames per gap
+
+        # Audio params
         self.sample_rate = 8000
         self.channels = 1
         self.bits_per_sample = 16
-        self.chunk_size = 120  # Уменьшили размер чанка для меньшей задержки
 
-        self.is_msbc = False  # текущий активный кодек (False=CVSD)
-        self.disable_cvsd_decode = False  # Если True, CVSD payload пропускается (для теста скорости)
-
-        self.stream = None  # Инициализация аудио потока
-        self.client_lock = threading.Lock()  # Блокировка для управления клиентами
-        self.current_client = None  # Инициализация текущего клиента
-        self.playback_thread = None  # Инициализация потока воспроизведения
-        self.audio_queue = queue.Queue(maxsize=400)  # Увеличен размер очереди для снижения дропов
-        self.log_file = open(self.log_file_path, "a")  # Инициализация файла логов
-
-        # Новый код для нарезки аудиоданных на сегменты
-        self.audio_buffer = []  # Буфер для хранения аудиоданных
-        self.audio_segment_duration = 20  # Длительность сегмента в секундах
-        self.last_audio_segment_time = time.time()
-
-        # Статистика
-        self.total_packets = 0  # Общее количество полученных пакетов
-        self.dropped_packets = 0  # Количество сброшенных пакетов
-        self.missed_packets = 0  # Количество пропущенных пакетов
-        self.packet_counter = 0  # Счетчик пакетов для отслеживания общего количества
-
-        # Буфер приема (TCP может дробить пакеты произвольно)
+        # Buffers
         self.recv_buffer = b''
-        self.last_stream_seq = None
-        self.expected_seq = None
-        self.header_done = False  # получили ли ASCII пролог "AUDIO_STREAM"
-        # self.raw_frame_mode = False      # режим приема "сырых" кадров без бинарного заголовка
-        # self.frame_size = None           # размер кадра в raw_frame_mode
-        # self.raw_mode_detect_window = 0  # сколько байт просмотрено при попытке sync
-        self.raw_assume_pcm = False  # будем ли трактовать raw кадры как уже PCM (не CVSD)
-        # Когда raw_assume_pcm=True, входные кадры считаются готовым PCM (не CVSD)
-        self.accept_legacy_magic = True   # временно принимаем старый magic от прошивки
+        self.header_done = False
 
-    def cleanup_logs(self):
-        """Очистка логов при завершении."""
-        with open(self.log_file_path, "w") as f:
-            f.write("")
+        # WAV segment
+        self.segment_start = time.time()
+        self.segment_frames = []
 
-    def log_packet(self, packet_id, size, timestamp):
-        if self.last_packet_id is not None:
-            # Обработка переполнения идентификатора пакета (64-битное значение)
-            if packet_id >= self.last_packet_id:
-                missed = packet_id - self.last_packet_id - 1
-            else:
-                # Переполнение: идентификатор сбросился на 0
-                missed = (packet_id + (2**64 - self.last_packet_id))
+        # Playback
+        self.audio_queue = queue.Queue(maxsize=240)
+        # Jitter buffer configuration (overridable via CLI)
+        self.prebuffer_ms = 300  # default increased
+        self.min_buffer_ms = 40
+        self.max_buffer_ms = 160
+        # Frame / buffering state
+        self.frame_samples = None
+        self.bytes_per_sample = 2  # s16le mono
+        self.play_started = False
+        self.buffered_ms = 0.0
+        self.stream = None
+        self.audio = None
 
-            # Убедимся, что значение пропущенных пакетов не отрицательное
-            missed = max(0, missed)
+        atexit.register(self._exit_summary)
+        atexit.register(self._close_packet_log)
 
-            if missed > 0:
-                self.missed_packets += missed
-                self.log_file.write(f"WARNING: Packet loss detected! Missed {missed} packets. Expected {self.last_packet_id + 1}, got {packet_id}\n")
-
-        self.packet_counter += 1
-        self.log_file.write(f"Packet {packet_id}: size={size}, timestamp={timestamp}\n")
-        self.last_packet_id = packet_id
-
-    def log_packet_with_delay(self, packet_id, size, timestamp, delay):
-        """Логирование пакета с задержкой"""
-        if self.last_packet_id is not None and packet_id != self.last_packet_id + 1:
-            self.log_file.write(f"WARNING: Packet loss detected! Expected {self.last_packet_id + 1}, got {packet_id}\n")
-        self.log_file.write(f"Packet {packet_id}: size={size}, timestamp={timestamp}, delay={delay:.3f}s\n")
-        self.last_packet_id = packet_id
-
-    def start(self):
-        """Запуск сервера"""
+    def _close_packet_log(self):
         try:
-            # Инициализация PyAudio
+            if hasattr(self, "packet_log_file") and self.packet_log_file:
+                self.packet_log_file.flush()
+                self.packet_log_file.close()
+        except:
+            pass
+
+    # ---------- Internal helpers ----------
+    def _init_audio(self):
+        import pyaudio
+        if self.audio is None:
             self.audio = pyaudio.PyAudio()
-
-            # Создание сокета
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.socket.bind((self.host, self.port))
-            self.socket.listen(1)
-
-            print(f"🎵 Аудио сервер запущен на {self.host}:{self.port}")
-            print("Ожидание подключения ESP32... (ASCII 'AUDIO_STREAM' + binary header или авто RAW fallback)")
-
-            self.running = True
-
-            while self.running:
-                try:
-                    client_socket, address = self.socket.accept()
-                    print(f"📱 Подключение от {address}")
-
-                    # Обрабатываем клиента в отдельном потоке
-                    client_thread = threading.Thread(
-                        target=self.handle_client,
-                        args=(client_socket, address)
-                    )
-                    client_thread.daemon = True
-                    client_thread.start()
-
-                except socket.error as e:
-                    if self.running:
-                        print(f"❌ Ошибка сокета: {e}")
-
-        except Exception as e:
-            print(f"❌ Ошибка запуска сервера: {e}")
-        finally:
-            self.cleanup()
-
-    def handle_client(self, client_socket, address):
-        """Обработка подключенного клиента"""
-        try:
-            with self.client_lock:
-                # Если уже есть подключенный клиент, закрываем его
-                if self.current_client and self.current_client != client_socket:
-                    print("🔌 Отключение предыдущего клиента")
-                    self.current_client.close()
-
-                # Обновляем текущего клиента
-                self.current_client = client_socket
-
-            # Запускаем воспроизведение в отдельном потоке
-            if not self.playback_thread or not self.playback_thread.is_alive():
-                self.playback_thread = threading.Thread(target=self.audio_playback_thread)
-                self.playback_thread.daemon = True
-                self.playback_thread.start()
-
-            # Основной цикл приема данных
-            self.receive_audio_data(client_socket)
-
-        except Exception as e:
-            print(f"❌ Ошибка обработки клиента {address}: {e}")
-        finally:
-            with self.client_lock:
-                if client_socket == self.current_client:
-                    self.current_client = None
-            client_socket.close()
-            print(f"📱 Отключение {address}")
-
-    # read_header and parse_header removed: protocol is now binary only
-
-    def init_audio_stream(self):
-        """Инициализация аудио потока для воспроизведения"""
-        try:
-            if self.stream:
+        if self.stream:
+            try:
+                self.stream.stop_stream()
                 self.stream.close()
+            except:
+                pass
+        format_map = {
+            8: pyaudio.paInt8,
+            16: pyaudio.paInt16,
+            24: pyaudio.paInt24,
+            32: pyaudio.paInt32
+        }
+        fmt = format_map.get(self.bits_per_sample, pyaudio.paInt16)
+        self.stream = self.audio.open(
+            format=fmt,
+            channels=self.channels,
+            rate=self.sample_rate,
+            output=True,
+            frames_per_buffer=120
+        )
+        print(f"🔊 Audio stream ready ({self.sample_rate} Hz)")
 
-            format_map = {
-                8: pyaudio.paInt8,
-                16: pyaudio.paInt16,
-                24: pyaudio.paInt24,
-                32: pyaudio.paInt32
-            }
+    def _packet_loss(self, seq, payload_len):
+        event = ""
+        gap = 0
+        now_rel = time.time() - self.segment_start  # relative time since start
+        if self.last_seq is None:
+            # first packet
+            self.expected_seq = seq
+            event = "START"
+        else:
+            self.expected_seq = (self.last_seq + 1) & 0xFFFFFFFF
+            if seq == self.last_seq:
+                self.dup_packets += 1
+                event = "DUP"
+            elif seq == self.expected_seq:
+                event = "CONT"
+            else:
+                # forward gap?
+                forward_gap = (seq - self.expected_seq) & 0xFFFFFFFF
+                if 0 < forward_gap < LOSS_IGNORE_HUGE_GAP:
+                    self.missed_packets += forward_gap
+                    gap = forward_gap
+                    self.gap_events += 1
+                    self.max_gap = max(self.max_gap, gap)
+                    event = "GAP"
+                    # Schedule concealment frames (simple PLC)
+                    self._gap_conceal_pending = min(self.max_gap_conceal_frames, gap)
+                else:
+                    # maybe reorder / wrap
+                    if seq < self.last_seq:
+                        self.reordered_packets += 1
+                        event = "REORDER"
+                    else:
+                        event = "RESET"
+        # Write CSV row
+        try:
+            if not hasattr(self, "_curr_underrun"):
+                self._curr_underrun = 0
+            self.packet_csv.writerow([
+                f"{now_rel:.6f}", seq, self.expected_seq, gap, event,
+                self.missed_packets, self.dup_packets, self.reordered_packets,
+                f"{self._curr_delta_ms:.3f}", self._curr_qsize, getattr(self, "_curr_underrun", 0),
+                self._curr_mean, self._curr_edge_jump, self.inserted_conceal_frames
+            ])
+            if (self.total_packets % 100) == 0:
+                self.packet_log_file.flush()
+        except:
+            pass
+        # Console quick notice for gaps or reorders
+        if event == "GAP":
+            if gap < 10:
+                print(f"⚠️ Gap {gap} packet(s): expected {self.expected_seq}, got {seq}")
+            else:
+                print(f"⚠️ Gap burst {gap} packets: expected {self.expected_seq}, got {seq}")
+        elif event == "REORDER":
+            print(f"↕️ Reorder: got {seq} after {self.last_seq}")
+        self.last_seq = seq
 
-            audio_format = format_map.get(self.bits_per_sample, pyaudio.paInt16)
+    def _save_segment_if_due(self):
+        now = time.time()
+        if now - self.segment_start >= self.segment_seconds and self.segment_frames:
+            filename = f"segment_{int(self.segment_start)}.wav"
+            try:
+                with wave.open(filename, 'wb') as wf:
+                    wf.setnchannels(self.channels)
+                    wf.setsampwidth(2)  # 16-bit
+                    wf.setframerate(self.sample_rate)
+                    wf.writeframes(b''.join(self.segment_frames))
+                print(f"💾 Saved {filename}")
+            except Exception as e:
+                print(f"❌ Save error: {e}")
+            self.segment_frames.clear()
+            self.segment_start = now
 
-            self.stream = self.audio.open(
-                format=audio_format,
-                channels=self.channels,
-                rate=self.sample_rate,
-                output=True,
-                frames_per_buffer=self.chunk_size
-            )
+    # New playback thread with packet aggregation
+    def _playback_thread(self):
+        import time
+        print("🔊 Playback thread started")
+        PLAY_INTERVAL = 0.05  # 50 ms
+        PACKET_DURATION = 0.0075  # 7.5 ms per packet
+        PACKETS_PER_CHUNK = int(PLAY_INTERVAL / PACKET_DURATION)
 
-            print("🔊 Аудио поток для воспроизведения инициализирован")
-
-        except Exception as e:
-            print(f"❌ Ошибка инициализации аудио потока: {e}")
-
-    def periodic_log(self):
-        """Периодическая запись в файл каждые 20 секунд."""
-        current_time = time.time()
-        if current_time - self.last_log_time >= self.log_interval:
-            with open(self.log_file_path, "a") as f:
-                f.write(f"Periodic log at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))}\n")
-            self.last_log_time = current_time
-
-    def save_audio_segment(self):
-        """Сохраняет текущий буфер аудиоданных в файл и очищает буфер."""
-        if not self.audio_buffer:
-            return
-
-        segment_filename = f"audio_segment_{int(time.time())}.wav"
-        with wave.open(segment_filename, 'wb') as wf:
-            wf.setnchannels(self.channels)
-            wf.setsampwidth(pyaudio.get_sample_size(pyaudio.paInt16))
-            wf.setframerate(self.sample_rate)
-            wf.writeframes(b''.join(self.audio_buffer))
-
-        print(f"💾 Аудиосегмент сохранён: {segment_filename}")
-        self.audio_buffer = []
-
-    def receive_audio_data(self, client_socket):
-        """Получение аудиоданных от клиента."""
-        print("🎤 Начало приема аудиоданных...")
+        chunk = bytearray()
+        last_write = time.time()
 
         while self.running:
             try:
-                chunk = client_socket.recv(4096)
+                pkt = self.audio_queue.get(timeout=0.01)
+                chunk.extend(pkt)
+                if len(chunk) >= PACKETS_PER_CHUNK * len(pkt):
+                    if self.stream:
+                        self.stream.write(bytes(chunk))
+                    chunk.clear()
+                    last_write = time.time()
+            except queue.Empty:
+                now = time.time()
+                if chunk and (now - last_write > PLAY_INTERVAL):
+                    if self.stream:
+                        self.stream.write(bytes(chunk))
+                    chunk.clear()
+                    last_write = now
+
+    def _exit_summary(self):
+        if self.total_packets:
+            print(f"[Exit] received={self.total_packets} lost={self.missed_packets} dropped={self.dropped_packets}")
+            print(f"[Exit] gaps={self.gap_events} max_gap={self.max_gap} dup={self.dup_packets} reorder={self.reordered_packets}")
+            if self.underrun_events:
+                print(f"[Exit] underruns={self.underrun_events}")
+
+    # ---------- Main server loop ----------
+    def start(self):
+        # Clean old segment files
+        for f in glob.glob("segment_*.wav"):
+            try: os.remove(f)
+            except: pass
+
+        try:
+            import pyaudio  # just to fail early if missing
+        except ImportError:
+            print("❌ PyAudio not installed. Install: pip install pyaudio")
+            return
+
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_sock.bind((self.host, self.port))
+        server_sock.listen(1)
+        print(f"🎵 Listening on {self.host}:{self.port}")
+        print("Waiting for client...")
+
+        try:
+            client_sock, addr = server_sock.accept()
+            print(f"📱 Client connected: {addr}")
+        except Exception as e:
+            print(f"❌ Accept failed: {e}")
+            server_sock.close()
+            return
+
+        self.running = True
+        threading.Thread(target=self._playback_thread, daemon=True).start()
+
+        while self.running:
+            try:
+                chunk = client_sock.recv(4096)
                 if not chunk:
-                    print("📡 Соединение закрыто клиентом")
+                    print("🔌 Client disconnected")
                     break
                 self.recv_buffer += chunk
 
-                # Если ещё не обработан ASCII пролог — пытаемся его выделить
+                # Optional ASCII preamble until blank line
                 if not self.header_done:
-                    sep_pos = self.recv_buffer.find(b"\n\n")
-                    if sep_pos != -1:
-                        header_blob = self.recv_buffer[:sep_pos+2]
-                        self.recv_buffer = self.recv_buffer[sep_pos+2:]
-                        try:
-                            header_txt = header_blob.decode(errors='ignore')
-                            if header_txt.startswith("AUDIO_STREAM"):
-                                # Парсим параметры
-                                sample_rate = self.sample_rate
-                                channels = self.channels
-                                bits = self.bits_per_sample
-                                codec_name = None
-                                for line in header_txt.splitlines():
-                                    if '=' in line:
-                                        k,v = line.split('=',1)
-                                        if k == 'sample_rate':
-                                            sample_rate = int(v)
-                                        elif k == 'channels':
-                                            channels = int(v)
-                                        elif k == 'bits_per_sample':
-                                            bits = int(v)
-                                        elif k == 'codec':
-                                            codec_name = v.strip().upper()
-                                self.sample_rate = sample_rate
-                                self.channels = channels
-                                self.bits_per_sample = bits
-                                if codec_name == 'MSBC':
-                                    self.is_msbc = True
-                                    self.sample_rate = 16000
-                                else:
-                                    self.is_msbc = False
-                                print(f"📄 Получен ASCII заголовок: {sample_rate}Hz {channels}ch {bits}bit codec={codec_name or 'UNKNOWN'}")
-                                self.header_done = True
-                                # Поток создадим позже (после первого декодированного пакета) — лениво
-                            else:
-                                print("ℹ️ Получен текст до бинарных пакетов, но не 'AUDIO_STREAM' — пропускаем")
-                                self.header_done = True  # чтобы не застрять
-                        except Exception as e:
-                            print(f"⚠️ Ошибка парсинга заголовка: {e}")
-                            self.header_done = True  # не повторять
+                    sep = self.recv_buffer.find(b"\n\n")
+                    if sep != -1:
+                        preamble = self.recv_buffer[:sep+2]
+                        self.recv_buffer = self.recv_buffer[sep+2:]
+                        text = preamble.decode(errors='ignore')
+                        if text.startswith("AUDIO_STREAM"):
+                            # parse very basic key=value
+                            for line in text.splitlines():
+                                if '=' in line:
+                                    k,v = line.split('=',1)
+                                    k=k.strip(); v=v.strip()
+                                    if k == 'sample_rate':
+                                        self.sample_rate = int(v)
+                                    elif k == 'channels':
+                                        self.channels = int(v)
+                                    elif k == 'bits_per_sample':
+                                        self.bits_per_sample = int(v)
+                                    elif k == 'codec':
+                                        if v.upper() == 'MSBC':
+                                            self.sample_rate = 16000
+                                        else:
+                                            self.sample_rate = 8000
+                            print(f"📄 Header: {self.sample_rate}Hz {self.channels}ch {self.bits_per_sample}bit")
+                        self.header_done = True
                     else:
-                        # ждём пока придёт полный заголовок или сразу начнётся бинарный поток
-                        # ограничим размер ожидаемого пролога
-                        if len(self.recv_buffer) > 2048:
-                            print("⚠️ Слишком длинный пролог без разделителя, сбрасываю")
-                            self.recv_buffer = b''
-                        continue
-                # После обработки (или отсутствия) заголовка синхронизируемся по magic
-                if self.last_stream_seq is None:
-                    # Строгий поиск нового или legacy magic – без raw fallback
-                    magic_new_le = STREAM_MAGIC_NEW.to_bytes(4, 'little')
-                    magic_old_le = STREAM_MAGIC_OLD.to_bytes(4, 'little')
-                    pos_new = self.recv_buffer.find(magic_new_le)
-                    pos_old = self.recv_buffer.find(magic_old_le) if self.accept_legacy_magic else -1
+                        if len(self.recv_buffer) < 2048:
+                            continue
+                        # fallback to binary if too long
+                        self.header_done = True
 
-                    chosen_magic = None
+                # Sync to first magic
+                if self.last_seq is None:
+                    magic_new = STREAM_MAGIC_NEW.to_bytes(4, 'little')
+                    magic_old = STREAM_MAGIC_OLD.to_bytes(4, 'little')
+                    pos_new = self.recv_buffer.find(magic_new)
+                    pos_old = self.recv_buffer.find(magic_old) if self.accept_legacy_magic else -1
                     pos = -1
+                    chosen = None
                     if pos_new != -1 and (pos_old == -1 or pos_new < pos_old):
-                        chosen_magic = STREAM_MAGIC_NEW
-                        pos = pos_new
+                        pos = pos_new; chosen = STREAM_MAGIC_NEW
                     elif pos_old != -1:
-                        chosen_magic = STREAM_MAGIC_OLD
-                        pos = pos_old
-
-                    if chosen_magic is None:
-                        # ограничиваем рост буфера
-                        if len(self.recv_buffer) > 4096:
+                        pos = pos_old; chosen = STREAM_MAGIC_OLD
+                    if chosen is None:
+                        if len(self.recv_buffer) > 8192:
                             self.recv_buffer = self.recv_buffer[-4096:]
                         continue
                     if pos > 0:
-                        print(f"ℹ️ Отбрасываем {pos} байт до первого magic (возможно остаток ASCII заголовка)")
                         self.recv_buffer = self.recv_buffer[pos:]
-                    # Зафиксируем используемый magic
-                    if chosen_magic == STREAM_MAGIC_OLD:
-                        print("⚠️ Используется legacy magic от прошивки (0x41554448). После обновления прошивки будет ожидаться новый 0x48445541.")
+                    if chosen == STREAM_MAGIC_OLD:
+                        print("⚠️ Legacy magic detected.")
                     else:
-                        print("✅ Найден новый magic (0x48445541).")
+                        print("✅ Magic synced (AUDH)")
                         self.accept_legacy_magic = False
-                    # Продолжаем – дальнейший разбор произойдет ниже в цикле пакетов
 
-                # Разбираем буфер: header + payload
+                # Consume complete packets
                 while True:
                     if len(self.recv_buffer) < STREAM_HEADER_SIZE:
-                        break  # ждём больше данных
-
-                    # Peek header
-                    header_bytes = self.recv_buffer[:STREAM_HEADER_SIZE]
-                    magic, seq, ts_us, payload_len, codec = STREAM_HEADER_STRUCT.unpack(header_bytes)
-
-                    if self.last_stream_seq is None:
-                        print(f"✅ Синхронизация: magic=0x{magic:08X} bytes=[{magic_bytes_le(magic)}]")
-                        # После первой синхронизации считаем, что payload CVSD = PCM
-                        self.raw_assume_pcm = True
-
+                        break
+                    header = self.recv_buffer[:STREAM_HEADER_SIZE]
+                    magic, seq, ts_us, payload_len, codec = STREAM_HEADER_STRUCT.unpack(header)
                     if not (magic == STREAM_MAGIC_NEW or (self.accept_legacy_magic and magic == STREAM_MAGIC_OLD)):
-                        # Попытка ресинхронизации: сдвигаем на 1 байт
-                        print(f"⚠️ Desync (magic=0x{magic:08X} != (0x{STREAM_MAGIC_NEW:08X} / 0x{STREAM_MAGIC_OLD:08X})), resync...")
+                        # resync: drop one byte
                         self.recv_buffer = self.recv_buffer[1:]
-                        continue
-
+                        break
+                    if payload_len == 0 or payload_len > 4096:
+                        # invalid length -> drop one byte
+                        self.recv_buffer = self.recv_buffer[1:]
+                        break
                     total_needed = STREAM_HEADER_SIZE + payload_len
                     if len(self.recv_buffer) < total_needed:
-                        # ждём оставшиеся байты payload
                         break
-
-                    # Извлекаем пакет целиком
                     packet = self.recv_buffer[:total_needed]
                     self.recv_buffer = self.recv_buffer[total_needed:]
-                    if payload_len == 0 or payload_len > 1024:
-                        print(f"⚠️ Нереалистичный payload_len={payload_len}, пропуск пакета")
-                        continue
-
-                    # Увеличиваем счетчик пакетов
-                    self.total_packets += 1
-                    self.packet_counter += 1
-
-                    # Потери (32-битный seq, wrap учитывается)
-                    if self.last_stream_seq is not None:
-                        expected = (self.last_stream_seq + 1) & 0xFFFFFFFF
-                        if seq != expected:
-                            # вычислим пропуск
-                            diff = (seq - expected) & 0xFFFFFFFF
-                            if diff != 0:
-                                self.missed_packets += diff
-                                print(f"⚠️ Пропуск {diff} пакетов (expected={expected} got={seq})")
-                    self.last_stream_seq = seq
-
-                    # Задержка (прием - метка отправителя)
-                    arrival_us = int(time.time() * 1_000_000)
-                    raw_delta_us = arrival_us - ts_us
-                    if raw_delta_us < 0 or raw_delta_us > 120_000_000:  # >120s считаем неверной меткой (например из-за несовместимых эпох)
-                        net_delay_ms = -1.0
-                    else:
-                        net_delay_ms = raw_delta_us / 1000.0
-                    if self.total_packets % 200 == 1:
-                        if net_delay_ms >= 0:
-                            print(f"🕒 seq={seq} delay={net_delay_ms:.1f}ms payload={payload_len} codec={codec}")
-                        else:
-                            print(f"🕒 seq={seq} delay=? payload={payload_len} codec={codec}")
-
-                    # Проверка кодека (если поменялся — перенастроим аудио при необходимости)
-                    if codec == STREAM_CODEC_MSBC and not getattr(self, 'is_msbc', False):
-                        print("🔁 Переключение в mSBC (16 kHz)")
-                        self.is_msbc = True
-                        self.sample_rate = 16000
-                        self.init_audio_stream()
-                    elif codec == STREAM_CODEC_CVSD and getattr(self, 'is_msbc', False):
-                        print("🔁 Переключение в CVSD (8 kHz)")
-                        self.is_msbc = False
-                        self.sample_rate = 8000
-                        self.init_audio_stream()
-
                     payload = packet[STREAM_HEADER_SIZE:]
-                    # Трактуем CVSD payload как уже готовый PCM (ESP шлет PCM 16-bit)
-                    if codec == STREAM_CODEC_CVSD:
-                        decoded_pcm = payload
-                    elif codec == STREAM_CODEC_MSBC:
-                        decoded_pcm = self.msbc_decoder.decode(payload)
+                    # Infer frame size once
+                    if self.frame_samples is None:
+                        if payload_len % (self.channels * self.bytes_per_sample) == 0:
+                            self.frame_samples = payload_len // (self.channels * self.bytes_per_sample)
+                            print(f"ℹ️ Inferred frame_samples={self.frame_samples} ({(self.frame_samples / self.sample_rate)*1000:.2f} ms per packet)")
+
+                    # Per-packet sample stats (s16le mono assumed)
+                    if payload_len >= 2:
+                        sample_count = payload_len // 2
+                        # Fast unpack for small frame
+                        frame_samples = struct.unpack('<' + 'h'*sample_count, payload)
+                        mean_val = int(sum(frame_samples) / sample_count)
+                        first_sample = frame_samples[0]
+                        last_sample = frame_samples[-1]
+                        edge_jump = 0
+                        if self.prev_last_sample is not None:
+                            edge_jump = abs(first_sample - self.prev_last_sample)
+                            if edge_jump > self.edge_jump_threshold:
+                                print(f"✨ Edge jump {edge_jump} at seq={seq}")
+                        self.prev_last_sample = last_sample
+                        self._curr_mean = mean_val
+                        self._curr_edge_jump = edge_jump
                     else:
-                        decoded_pcm = None
-                    if not decoded_pcm:
-                        continue
-                    if self.stream is None:
-                        # Инициализируем поток исходя из текущих параметров (sample_rate может обновляться при переключении кодека)
-                        self.init_audio_stream()
-                    processed = self.process_audio_data(decoded_pcm, seq=seq)
-                    if processed is None:
-                        continue
+                        self._curr_mean = 0
+                        self._curr_edge_jump = 0
+
+                    # Arrival timing diagnostics
+                    now = time.time()
+                    if self.prev_arrival is None:
+                        self._curr_delta_ms = 0.0
+                        # Initialize average to zero to avoid None formatting issues
+                        self.avg_delta_ms = 0.0
+                    else:
+                        self._curr_delta_ms = (now - self.prev_arrival) * 1000.0
+                        if self.avg_delta_ms == 0.0:
+                            self.avg_delta_ms = self._curr_delta_ms
+                        else:
+                            # exponential smoothing
+                            self.avg_delta_ms = 0.9 * self.avg_delta_ms + 0.1 * self._curr_delta_ms
+                        if self.avg_delta_ms > 0 and self._curr_delta_ms > self.avg_delta_ms * 2.5 and self._curr_delta_ms > 5:
+                            print(f"⏱️  Inter-packet gap {self._curr_delta_ms:.2f} ms (avg ~{self.avg_delta_ms:.2f} ms) seq={seq}")
+                    self.prev_arrival = now
+
+                    # Stats
+                    self.total_packets += 1
+                    self._packet_loss(seq, payload_len)
+                    # Insert concealment frames if a gap was detected
+                    if self._gap_conceal_pending > 0 and self.frame_samples:
+                        # Use last real payload as template (or silence if none)
+                        base_frame = payload if payload_len > 0 else (b'\x00' * (self.frame_samples * 2))
+                        for _ in range(self._gap_conceal_pending):
+                            try:
+                                self.audio_queue.put_nowait(base_frame)
+                                self.inserted_conceal_frames += 1
+                            except queue.Full:
+                                break
+                        self._gap_conceal_pending = 0
+
+                    # Adjust sample rate on codec
+                    desired_rate = 16000 if codec == CODEC_MSBC else 8000
+                    if desired_rate != self.sample_rate or self.stream is None:
+                        self.sample_rate = desired_rate
+                        self._init_audio()
+
+                    # Update buffered duration
+                    if self.frame_samples:
+                        self.buffered_ms = (self.audio_queue.qsize() * self.frame_samples * 1000.0) / self.sample_rate
+                    else:
+                        self.buffered_ms = 0.0
+                    # Queue / underrun check
+                    self._curr_qsize = self.audio_queue.qsize()
+                    underrun_flag = 0
+                    if self.stream and self._curr_qsize == 0 and self.total_packets > 1:
+                        # Playback thread likely starved since previous packet
+                        underrun_flag = 1
+                        self.underrun_events += 1
+                        print(f"🥾 Underrun (playback starved) before seq={seq}")
+                    self._curr_underrun = underrun_flag
+
+                    # Enqueue payload
                     try:
-                        self.audio_queue.put_nowait(processed)
+                        self.audio_queue.put_nowait(payload)
                     except queue.Full:
                         self.dropped_packets += 1
-                        if (self.dropped_packets % 50) == 1:
-                            print(f"⚠️ Очередь переполнена: сброшено {self.dropped_packets} пакетов")
 
+                    # Add to current segment
+                    self.segment_frames.append(payload)
+                    self._save_segment_if_due()
+
+                    # Light periodic log
+                    if (self.total_packets % 200) == 1:
+                        avg_disp = self.avg_delta_ms if self.avg_delta_ms is not None else 0.0
+                        buf_ms = getattr(self, 'buffered_ms', 0.0)
+                        print(f"🕒 seq={seq} packets={self.total_packets} lost={self.missed_packets} gaps={self.gap_events} "
+                              f"max_gap={self.max_gap} dup={self.dup_packets} reord={self.reordered_packets} dropped={self.dropped_packets} "
+                              f"avgΔ={avg_disp:.2f}ms underruns={self.underrun_events} buf={buf_ms:.1f}ms conceal={self.inserted_conceal_frames}")
+
+            except KeyboardInterrupt:
+                print("🛑 Keyboard interrupt")
+                break
             except Exception as e:
-                print(f"❌ Ошибка приема данных: {e}")
+                print(f"❌ Receive error: {e}")
                 break
 
-    def process_audio_data(self, pcm_bytes, seq=None):
-        """Обработка уже декодированных PCM s16le аудио данных"""
-        try:
-            if not pcm_bytes:
-                return None
-            audio_array = np.frombuffer(pcm_bytes, dtype=np.int16)
-            if audio_array.size == 0:
-                return None
-
-            # Если очередь близка к заполнению, пропускаем AGC чтобы ускориться
-            if self.audio_queue.qsize() > (self.audio_queue.maxsize * 0.85):
-                return pcm_bytes
-
-            # self.packet_counter += 1  # Удалено: теперь счетчик инкрементируется только в receive_audio_data
-            max_val = int(np.max(np.abs(audio_array)))
-            avg_val = float(np.mean(np.abs(audio_array)))
-            rms_val = float(np.sqrt(np.mean(audio_array.astype(np.float32) ** 2)))
-
-            # Диагностика пустых / почти пустых пакетов
-            if max_val == 0 and avg_val == 0.0:
-                if (self.packet_counter % 20) == 1:
-                    if seq is not None:
-                        print(f"⚠️ Пустой аудио пакет #{self.packet_counter} seq={seq}")
-                    else:
-                        print(f"⚠️ Пустой аудио пакет #{self.packet_counter}")
-                self.log_file.write(f"[WARN] Пустой аудио пакет #{self.packet_counter}\n")
-                self.log_file.flush()
-
-            # Предупреждение о клиппинге
-            if max_val > 32000:
-                if seq is not None:
-                    print(f"⚠️ Аномально громкий пакет #{self.packet_counter}: seq={seq} max={max_val}")
-                else:
-                    print(f"⚠️ Аномально громкий пакет #{self.packet_counter}: max={max_val}")
-                self.log_file.write(f"[WARN] Loud packet #{self.packet_counter} max={max_val}\n")
-                self.log_file.flush()
-
-            # Легкая нормализация (AGC)
-            if 0 < rms_val < 800:
-                gain = min(4.0, 500.0 / rms_val)
-                audio_array = np.clip(audio_array.astype(np.float32) * gain, -32768, 32767).astype(np.int16)
-
-            return audio_array.tobytes()
-        except Exception as e:
-            print(f"❌ Ошибка обработки PCM: {e}")
-            return None
-
-    def audio_playback_thread(self):
-        """Поток воспроизведения аудио"""
-        print("🔊 Поток воспроизведения запущен")
-
-        while self.running:
-            try:
-                with self.client_lock:
-                    # Если нет текущего клиента, ждем
-                    if not self.current_client:
-                        time.sleep(0.1)
-                        continue
-
-                # Получаем данные из очереди
-                audio_data = self.audio_queue.get(timeout=1.0)
-
-                # Воспроизводим
-                if self.stream:
-                    self.stream.write(audio_data)
-
-            except queue.Empty:
-                continue
-            except Exception as e:
-                print(f"❌ Ошибка воспроизведения: {e}")
-                time.sleep(0.1)
+        self.stop()
+        client_sock.close()
+        server_sock.close()
 
     def stop(self):
-        """Остановка сервера"""
-        print(f"\n📊 Статистика: получено={self.total_packets}, сброшено={self.dropped_packets}, пропущено={self.missed_packets}")
+        if not self.running:
+            return
         self.running = False
-
-    def cleanup(self):
-        """Очистка ресурсов"""
+        print(f"\n📊 Stats: received={self.total_packets} lost={self.missed_packets} dropped={self.dropped_packets}")
+        if hasattr(self, 'buffered_ms'):
+            print(f"⌛ Final buffer={self.buffered_ms:.1f} ms (pre={self.prebuffer_ms} min={self.min_buffer_ms} max={self.max_buffer_ms})")
+        if self.underrun_events:
+            print(f"🪫 Total underruns detected: {self.underrun_events}")
         if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
-
+            try:
+                self.stream.stop_stream(); self.stream.close()
+            except:
+                pass
         if self.audio:
-            self.audio.terminate()
-
-        if self.socket:
-            self.socket.close()
-
-        print("✅ Сервер остановлен")
+            try:
+                self.audio.terminate()
+            except:
+                pass
+        if self.inserted_conceal_frames:
+            print(f"🩹 Concealment frames inserted: {self.inserted_conceal_frames}")
+        self._close_packet_log()
+        print(f"📝 Packet log saved to {self.packet_log_path}")
+        print("✅ Server stopped")
 
 def main():
-    parser = argparse.ArgumentParser(description='Аудио сервер для ESP32')
-    parser.add_argument('--host', default='0.0.0.0', help='IP адрес сервера')
-    parser.add_argument('--port', type=int, default=8888, help='Порт сервера')
-
+    parser = argparse.ArgumentParser(description="Minimal audio server")
+    parser.add_argument('--host', default='0.0.0.0')
+    parser.add_argument('--port', type=int, default=8888)
+    parser.add_argument('--prebuffer-ms', type=int, default=300, help='Prebuffer duration before playback (ms)')
+    parser.add_argument('--min-buffer-ms', type=int, default=40, help='Lower watermark (ms) for PLC insertion')
+    parser.add_argument('--max-buffer-ms', type=int, default=160, help='Upper watermark (ms) to clamp latency')
     args = parser.parse_args()
-
-    # Проверяем наличие PyAudio
-    try:
-        import pyaudio
-    except ImportError:
-        print("❌ PyAudio не установлен. Установите: pip install pyaudio")
-        sys.exit(1)
-
     server = AudioServer(args.host, args.port)
-
-    try:
-        server.start()
-    except KeyboardInterrupt:
-        server.stop()
+    server.prebuffer_ms = args.prebuffer_ms
+    server.min_buffer_ms = args.min_buffer_ms
+    server.max_buffer_ms = args.max_buffer_ms
+    server.start()
 
 if __name__ == '__main__':
     main()

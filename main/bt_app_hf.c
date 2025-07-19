@@ -138,6 +138,14 @@ static SemaphoreHandle_t s_send_data_Semaphore = NULL;
 static TaskHandle_t s_bt_app_send_data_task_handler = NULL;
 static esp_hf_audio_state_t s_audio_code;
 
+// --- Latency / sequence diagnostics ---
+static uint32_t s_last_sent_seq = 0;
+static uint32_t s_incoming_cb_counter = 0;      // counts every bt_app_hf_incoming_cb invocation
+static uint64_t s_first_packet_time_us = 0;
+static uint64_t s_last_log_time_us = 0;
+static uint32_t s_lost_seq_estimate = 0;        // local detection of gaps (should normally stay 0)
+static uint32_t s_prev_header_seq = 0;
+
 // ---- Custom packet header for streaming (sequence + timestamp) ----
 // This header is prepended (in little-endian format) before each audio payload
 // sent to the server to help detect packet loss, reordering, and jitter.
@@ -151,8 +159,8 @@ typedef struct __attribute__((packed)) {
     uint16_t codec;        // 1 = CVSD, 2 = mSBC (extend as needed)
 } stream_packet_header_t;
 
+#define STREAM_PACKET_MAGIC 0x48445541u  // 'H''D''U''A' (new magic for updated protocol)
 static uint32_t s_stream_seq = 0;
-#define STREAM_PACKET_MAGIC 0x41554448u  // 'A''U''D''H'
 #define STREAM_CODEC_CVSD   1
 #define STREAM_CODEC_MSBC   2
 
@@ -270,15 +278,18 @@ static uint32_t bt_app_hf_outgoing_cb(uint8_t *p_buf, uint32_t sz)
 
 static void bt_app_hf_incoming_cb(const uint8_t *buf, uint32_t sz)
 {
-    // Принудительное логирование КАЖДОГО вызова для диагностики
-    static uint32_t packet_counter = 0;
+    // Диагностика входящих PCM блоков (каждый вызов => 7.5 ms для CVSD / 120 байт)
     static uint32_t failed_sends = 0;
-    packet_counter++;
+    s_incoming_cb_counter++;
+    if (s_first_packet_time_us == 0) {
+        s_first_packet_time_us = esp_timer_get_time();
+        s_last_log_time_us = s_first_packet_time_us;
+    }
 
-    // Логируем ПЕРВЫЕ 10 пакетов для диагностики, затем каждый 50-й
-    if (packet_counter <= 10 || packet_counter % 50 == 1) {
+    // Логируем ПЕРВЫЕ 10 пакетов для диагностики, затем каждый 200-й
+    if (s_incoming_cb_counter <= 10 || s_incoming_cb_counter % 200 == 1) {
         ESP_LOGW(BT_HF_TAG, "🔥 INCOMING AUDIO CALLBACK #%"PRIu32": size=%"PRIu32" bytes, buf=%p",
-                packet_counter, sz, buf);
+                s_incoming_cb_counter, sz, buf);
     }
 
     if (sz == 0 || buf == NULL) {
@@ -287,25 +298,25 @@ static void bt_app_hf_incoming_cb(const uint8_t *buf, uint32_t sz)
     }
 
     // Принудительная диагностика первых байтов
-    if (packet_counter <= 5) {
+    if (s_incoming_cb_counter <= 5) {
         ESP_LOGW(BT_HF_TAG, "📋 First 8 bytes: %02x %02x %02x %02x %02x %02x %02x %02x",
                 buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
     }
 
-    if (packet_counter == 1) {
-        ESP_LOGI(BT_HF_TAG, "Packet header size=%u bytes (magic=0x%08"PRIx32")", (unsigned)sizeof(stream_packet_header_t), (unsigned long)STREAM_PACKET_MAGIC);
+    if (s_incoming_cb_counter == 1) {
+        ESP_LOGI(BT_HF_TAG, "Packet header size=%u bytes (magic=0x%08" PRIx32 ")", (unsigned)sizeof(stream_packet_header_t), (uint32_t)STREAM_PACKET_MAGIC);
     }
 
     s_time_new = esp_timer_get_time();
-    s_data_num += sz;
+    s_data_num += sz;  // keep bandwidth stats
 
     // Анализ уровня сигнала микрофона
     analyze_mic_level(buf, sz);
 
     // Проверяем состояние аудио стриминга
     if (!audio_streaming_is_connected()) {
-        if (packet_counter % 100 == 1) {
-            ESP_LOGW(BT_HF_TAG, "⚠️ Audio streaming not connected! Packets lost: %"PRIu32, failed_sends);
+        if (s_incoming_cb_counter % 200 == 1) {
+            ESP_LOGW(BT_HF_TAG, "⚠️ Audio streaming not connected! dropped=%"PRIu32, failed_sends);
         }
         failed_sends++;
         return;
@@ -313,6 +324,7 @@ static void bt_app_hf_incoming_cb(const uint8_t *buf, uint32_t sz)
 
     // Формируем пакет с заголовком (sequence + timestamp) перед отправкой
     // Header + payload layout: [stream_packet_header_t][audio bytes...]
+    uint32_t seq_to_send = s_stream_seq;  // capture current sequence for consistent local logging
     stream_packet_header_t header;
     header.magic        = STREAM_PACKET_MAGIC;
     header.seq          = s_stream_seq++;
@@ -320,11 +332,17 @@ static void bt_app_hf_incoming_cb(const uint8_t *buf, uint32_t sz)
     header.payload_len  = (uint16_t)sz;
     header.codec        = (s_audio_code == ESP_HF_AUDIO_STATE_CONNECTED_MSBC) ? STREAM_CODEC_MSBC : STREAM_CODEC_CVSD;
 
+    // Local gap detection (should normally be sequential: last + 1)
+    if (s_prev_header_seq != 0 && seq_to_send != s_prev_header_seq + 1) {
+        s_lost_seq_estimate += (seq_to_send - (s_prev_header_seq + 1));
+    }
+    s_prev_header_seq = seq_to_send;
+
     size_t packet_size = sizeof(header) + sz;
     uint8_t *packet = (uint8_t *)osi_malloc(packet_size);
     if (!packet) {
         failed_sends++;
-        if (packet_counter % 100 == 1) {
+        if (s_incoming_cb_counter % 200 == 1) {
             ESP_LOGE(BT_HF_TAG, "❌ OOM allocating packet (%u bytes), drops=%"PRIu32, (unsigned)packet_size, failed_sends);
         }
         return;
@@ -337,13 +355,24 @@ static void bt_app_hf_incoming_cb(const uint8_t *buf, uint32_t sz)
 
     if (stream_result != ESP_OK) {
         failed_sends++;
-        if (packet_counter % 100 == 1) {
+        if (s_incoming_cb_counter % 200 == 1) {
             ESP_LOGW(BT_HF_TAG, "📡 Audio streaming send failed: %s (total failed: %"PRIu32")",
                      esp_err_to_name(stream_result), failed_sends);
         }
-    } else if (packet_counter % 200 == 1) {
-        ESP_LOGI(BT_HF_TAG, "✅ Audio streaming: packet #%"PRIu32" (seq=%"PRIu32") sent, payload=%"PRIu32" bytes",
-                 packet_counter, header.seq, sz);
+    } else if (s_incoming_cb_counter % 400 == 1) {
+        uint64_t now_us = esp_timer_get_time();
+        uint64_t stream_duration_ms = (now_us - s_first_packet_time_us) / 1000;
+        uint64_t packet_latency_us = now_us - header.timestamp_us;
+        float pkt_rate = (float)s_incoming_cb_counter * 1000000.0f / (float)(now_us - s_first_packet_time_us); // packets per second
+        ESP_LOGI(BT_HF_TAG,
+                 "✅ TX pkt_cb=%"PRIu32" seq=%"PRIu32" sent payload=%"PRIu32"B latency=%"PRIu64"us rate=%.2fpps lost_local=%"PRIu32" uptime=%"PRIu64"ms",
+                 s_incoming_cb_counter, header.seq, sz, packet_latency_us, pkt_rate, s_lost_seq_estimate, stream_duration_ms);
+    }
+
+    static bool latency_hint_logged = false;
+    if (!latency_hint_logged) {
+        ESP_LOGI(BT_HF_TAG, "ℹ️ Low-latency mode active: every PCM frame forwarded immediately with minimal buffering.");
+        latency_hint_logged = true;
     }
 
     if ((s_time_new - s_time_old) >= 3000000) {
@@ -401,10 +430,8 @@ static void bt_app_send_data_task(void *arg)
         if (xSemaphoreTake(s_send_data_Semaphore, (TickType_t)portMAX_DELAY)) {
             send_counter++;
 
-            // Отправляем данные только каждый 10-й раз для снижения нагрузки
-            if (send_counter % 10 != 0) {
-                continue;
-            }
+            // Ранее мы пропускали 9 из 10 итераций; для снижения задержки убрано.
+            // (Можно вернуть условие при перегрузке ЦП.)
 
             s_now_enter_time = esp_timer_get_time();
             s_us_duration = s_now_enter_time - s_last_enter_time;
@@ -420,8 +447,8 @@ static void bt_app_send_data_task(void *arg)
                 continue;
             }
 
-            // Уменьшаем размер исходящих данных
-            frame_data_num = frame_data_num / 4; // Уменьшаем в 4 раза
+            // Не уменьшаем frame_data_num, передаём полный блок для предсказуемого тайминга
+            // (Возможна оптимизация CPU → вернуть деление при необходимости.)
 
             buf = osi_malloc(frame_data_num);
             if (!buf) {
@@ -440,11 +467,11 @@ static void bt_app_send_data_task(void *arg)
             vRingbufferGetInfo(s_m_rb, NULL, NULL, NULL, NULL, &item_size);
 
             if(s_audio_code == ESP_HF_AUDIO_STATE_CONNECTED_MSBC) {
-                if(item_size >= WBS_PCM_INPUT_DATA_SIZE/4) { // Уменьшаем порог
+                if(item_size >= WBS_PCM_INPUT_DATA_SIZE) { // Полный блок для отправки
                     esp_hf_ag_outgoing_data_ready();
                 }
             } else {
-                if(item_size >= PCM_INPUT_DATA_SIZE/4) { // Уменьшаем порог
+                if(item_size >= PCM_INPUT_DATA_SIZE) { // Полный блок
                     esp_hf_ag_outgoing_data_ready();
                 }
             }
