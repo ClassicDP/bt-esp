@@ -4,6 +4,7 @@
 Поддерживает CVSD и mSBC кодеки
 """
 
+
 import socket
 import threading
 import struct
@@ -20,8 +21,32 @@ import os
 
 import atexit
 
-
 from collections import deque, Counter
+
+# ---- Stream packet header (must match firmware) ----
+# C struct (little-endian packed):
+# typedef struct {
+#     uint32_t magic;
+#     uint32_t seq;
+#     uint64_t timestamp_us;
+#     uint16_t payload_len;
+#     uint16_t codec;
+# } stream_packet_header_t;
+# NOTE: сервер теперь может автоматически переключаться в raw_frame_mode, если не находит magic
+# RAW fallback disabled – now strict header mode with dual magic acceptance.
+STREAM_HEADER_STRUCT = struct.Struct('<IIQHH')
+STREAM_HEADER_SIZE = STREAM_HEADER_STRUCT.size  # 20 bytes
+STREAM_MAGIC_NEW = 0x48445541  # 'AUDH' target magic (bytes: 41 55 44 48)
+STREAM_MAGIC_OLD = 0x41554448  # legacy magic currently sent by ESP (bytes: 48 44 55 41)
+STREAM_MAGIC = STREAM_MAGIC_NEW
+STREAM_CODEC_CVSD = 1
+STREAM_CODEC_MSBC = 2
+
+PCM_FALLBACK_ENABLED = False  # отключаем raw fallback – хотим строгий заголовок
+
+# Helper to pretty-print magic bytes in little-endian order
+def magic_bytes_le(val: int):
+    return ' '.join(f'{b:02X}' for b in val.to_bytes(4, 'little'))
 
 # --- Packet sequence analysis tuning constants ---
 # Предполагаемая частота пакетов: ~60 сэмплов при 8 кГц => ~133 пакета/сек
@@ -387,13 +412,16 @@ class AudioServer:
         self.sample_rate = 8000
         self.channels = 1
         self.bits_per_sample = 16
-        self.chunk_size = 512  # Уменьшили размер чанка для меньшей задержки
+        self.chunk_size = 120  # Уменьшили размер чанка для меньшей задержки
+
+        self.is_msbc = False  # текущий активный кодек (False=CVSD)
+        self.disable_cvsd_decode = False  # Если True, CVSD payload пропускается (для теста скорости)
 
         self.stream = None  # Инициализация аудио потока
         self.client_lock = threading.Lock()  # Блокировка для управления клиентами
         self.current_client = None  # Инициализация текущего клиента
         self.playback_thread = None  # Инициализация потока воспроизведения
-        self.audio_queue = queue.Queue(maxsize=100)  # Очередь для аудиоданных
+        self.audio_queue = queue.Queue(maxsize=400)  # Увеличен размер очереди для снижения дропов
         self.log_file = open(self.log_file_path, "a")  # Инициализация файла логов
 
         # Новый код для нарезки аудиоданных на сегменты
@@ -407,20 +435,17 @@ class AudioServer:
         self.missed_packets = 0  # Количество пропущенных пакетов
         self.packet_counter = 0  # Счетчик пакетов для отслеживания общего количества
 
-        # Параметры для учета потерь пакетов
-        self.packet_bits = 32           # ширина счетчика пакетов на стороне ESP
-        self.ignore_large_jump = True   # фильтр аномальных скачков
-        self.max_reasonable_gap = 5000  # максимум, что считаем реальной потерей (подбери)
-        self.duplicate_packets = 0
-        self.out_of_order_packets = 0
-
-        # Анализ последовательности пакетов
-        self.seq_analyzer = SequenceAnalyzer()
-        self.loss_accounting_enabled = False
-        self.unreliable_message_suppressed = False
-        self.loss_suppressed = False
-        self.consecutive_ok = 0
-        self.noisy_jumps = 0
+        # Буфер приема (TCP может дробить пакеты произвольно)
+        self.recv_buffer = b''
+        self.last_stream_seq = None
+        self.expected_seq = None
+        self.header_done = False  # получили ли ASCII пролог "AUDIO_STREAM"
+        # self.raw_frame_mode = False      # режим приема "сырых" кадров без бинарного заголовка
+        # self.frame_size = None           # размер кадра в raw_frame_mode
+        # self.raw_mode_detect_window = 0  # сколько байт просмотрено при попытке sync
+        self.raw_assume_pcm = False  # будем ли трактовать raw кадры как уже PCM (не CVSD)
+        # Когда raw_assume_pcm=True, входные кадры считаются готовым PCM (не CVSD)
+        self.accept_legacy_magic = True   # временно принимаем старый magic от прошивки
 
     def cleanup_logs(self):
         """Очистка логов при завершении."""
@@ -467,7 +492,7 @@ class AudioServer:
             self.socket.listen(1)
 
             print(f"🎵 Аудио сервер запущен на {self.host}:{self.port}")
-            print("Ожидание подключения ESP32...")
+            print("Ожидание подключения ESP32... (ASCII 'AUDIO_STREAM' + binary header или авто RAW fallback)")
 
             self.running = True
 
@@ -496,32 +521,23 @@ class AudioServer:
     def handle_client(self, client_socket, address):
         """Обработка подключенного клиента"""
         try:
-            # Читаем заголовок
-            header = self.read_header(client_socket)
-            if header:
-                self.parse_header(header)
-                print(f"🔧 Параметры аудио: {self.sample_rate}Hz, {self.channels}ch, {self.bits_per_sample}bit")
+            with self.client_lock:
+                # Если уже есть подключенный клиент, закрываем его
+                if self.current_client and self.current_client != client_socket:
+                    print("🔌 Отключение предыдущего клиента")
+                    self.current_client.close()
 
-                # Инициализируем аудио поток для воспроизведения
-                self.init_audio_stream()
+                # Обновляем текущего клиента
+                self.current_client = client_socket
 
-                with self.client_lock:
-                    # Если уже есть подключенный клиент, закрываем его
-                    if self.current_client and self.current_client != client_socket:
-                        print("🔌 Отключение предыдущего клиента")
-                        self.current_client.close()
+            # Запускаем воспроизведение в отдельном потоке
+            if not self.playback_thread or not self.playback_thread.is_alive():
+                self.playback_thread = threading.Thread(target=self.audio_playback_thread)
+                self.playback_thread.daemon = True
+                self.playback_thread.start()
 
-                    # Обновляем текущего клиента
-                    self.current_client = client_socket
-
-                # Запускаем воспроизведение в отдельном потоке
-                if not self.playback_thread or not self.playback_thread.is_alive():
-                    self.playback_thread = threading.Thread(target=self.audio_playback_thread)
-                    self.playback_thread.daemon = True
-                    self.playback_thread.start()
-
-                # Основной цикл приема данных
-                self.receive_audio_data(client_socket)
+            # Основной цикл приема данных
+            self.receive_audio_data(client_socket)
 
         except Exception as e:
             print(f"❌ Ошибка обработки клиента {address}: {e}")
@@ -532,59 +548,7 @@ class AudioServer:
             client_socket.close()
             print(f"📱 Отключение {address}")
 
-    def read_header(self, client_socket):
-        """Чтение заголовка с параметрами потока"""
-        try:
-            header = b""
-            while b"\n\n" not in header:
-                data = client_socket.recv(1)
-                if not data:
-                    return None
-                header += data
-
-                # Защита от слишком длинного заголовка
-                if len(header) > 1024:
-                    print("❌ Слишком длинный заголовок")
-                    return None
-
-            return header.decode('utf-8')
-        except Exception as e:
-            print(f"❌ Ошибка чтения заголовка: {e}")
-            return None
-
-    def parse_header(self, header):
-        """Парсинг заголовка с параметрами аудио"""
-        lines = header.strip().split('\n')
-
-        for line in lines:
-            if '=' in line:
-                key, value = line.split('=', 1)
-                if key == 'sample_rate':
-                    self.sample_rate = int(value)
-                elif key == 'channels':
-                    self.channels = int(value)
-                elif key == 'bits_per_sample':
-                    self.bits_per_sample = int(value)
-                elif key == 'codec':
-                    self.codec_type = value
-
-        # Определяем кодек на основе заголовка или частоты дискретизации
-        if hasattr(self, 'codec_type'):
-            if self.codec_type.upper() == 'MSBC':
-                print("🔧 Обнаружен mSBC кодек из заголовка")
-                self.is_msbc = True
-                self.sample_rate = 16000  # mSBC всегда 16 кГц
-            else:
-                print(f"🔧 Обнаружен кодек {self.codec_type}")
-                self.is_msbc = False
-        else:
-            # Фолбэк: определяем по частоте дискретизации
-            if self.sample_rate == 16000:
-                print("🔧 Обнаружен mSBC кодек (16 кГц)")
-                self.is_msbc = True
-            else:
-                print("🔧 Обнаружен CVSD кодек (8 кГц)")
-                self.is_msbc = False
+    # read_header and parse_header removed: protocol is now binary only
 
     def init_audio_stream(self):
         """Инициализация аудио потока для воспроизведения"""
@@ -643,133 +607,238 @@ class AudioServer:
 
         while self.running:
             try:
-                data = client_socket.recv(4096)
-                if not data:
+                chunk = client_socket.recv(4096)
+                if not chunk:
                     print("📡 Соединение закрыто клиентом")
                     break
+                self.recv_buffer += chunk
 
-                self.total_packets += 1
-
-                # --- Извлекаем и анализируем «сырые» 4 байта идентификатора ---
-                if len(data) < 8:
-                    print(f"⚠️ Короткий пакет: len={len(data)}")
-                    continue
-
-                raw4 = data[:4]
-                self.seq_analyzer.add(raw4)
-
-                if not self.seq_analyzer.format_determined:
-                    if self.packet_counter < 64:
-                        print(f"SEQ RAW {self.packet_counter+1}: {raw4.hex()} (ожидаю определение формата...)")
-                else:
-                    if self.seq_analyzer.unreliable and not self.loss_accounting_enabled:
-                        if not self.unreliable_message_suppressed:
-                            if self.seq_analyzer.unreliable_warns < self.seq_analyzer.max_unreliable_warns:
-                                print("⚠️ Поле счетчика выглядит ненадежным. Учет потерь отключен.")
-                                self.seq_analyzer.unreliable_warns += 1
+                # Если ещё не обработан ASCII пролог — пытаемся его выделить
+                if not self.header_done:
+                    sep_pos = self.recv_buffer.find(b"\n\n")
+                    if sep_pos != -1:
+                        header_blob = self.recv_buffer[:sep_pos+2]
+                        self.recv_buffer = self.recv_buffer[sep_pos+2:]
+                        try:
+                            header_txt = header_blob.decode(errors='ignore')
+                            if header_txt.startswith("AUDIO_STREAM"):
+                                # Парсим параметры
+                                sample_rate = self.sample_rate
+                                channels = self.channels
+                                bits = self.bits_per_sample
+                                codec_name = None
+                                for line in header_txt.splitlines():
+                                    if '=' in line:
+                                        k,v = line.split('=',1)
+                                        if k == 'sample_rate':
+                                            sample_rate = int(v)
+                                        elif k == 'channels':
+                                            channels = int(v)
+                                        elif k == 'bits_per_sample':
+                                            bits = int(v)
+                                        elif k == 'codec':
+                                            codec_name = v.strip().upper()
+                                self.sample_rate = sample_rate
+                                self.channels = channels
+                                self.bits_per_sample = bits
+                                if codec_name == 'MSBC':
+                                    self.is_msbc = True
+                                    self.sample_rate = 16000
+                                else:
+                                    self.is_msbc = False
+                                print(f"📄 Получен ASCII заголовок: {sample_rate}Hz {channels}ch {bits}bit codec={codec_name or 'UNKNOWN'}")
+                                self.header_done = True
+                                # Поток создадим позже (после первого декодированного пакета) — лениво
                             else:
-                                print("⚠️ Поле счетчика ненадежно (дальнейшие сообщения скрыты).")
-                                self.unreliable_message_suppressed = True
-                        self.loss_accounting_enabled = False
-                    elif not self.seq_analyzer.unreliable and not self.loss_accounting_enabled:
-                        print(f"✅ Формат счетчика определен: "
-                              f"{'16-bit' if self.seq_analyzer.use_masked_16 else '32-bit'} "
-                              f"{self.seq_analyzer.endian}-endian "
-                              f"(исп. байты {self.seq_analyzer.mask_bytes if self.seq_analyzer.use_masked_16 else '0..3'})")
-                        self.loss_accounting_enabled = True
-
-                # Получаем нормализованный sequence (может быть None пока не определено)
-                packet_id = self.seq_analyzer.extract_sequence(raw4)
-
-                # --- Учет потерь (если формат распознан) ---
-                if self.loss_accounting_enabled and packet_id is not None:
-                    missed, wrapped, valid, noisy = packet_loss_delta(self.last_packet_id, packet_id,
-                                                                      bits=(16 if self.seq_analyzer.use_masked_16 else 32))
-                    if noisy:
-                        self.noisy_jumps += 1
-                        # подавляем учет потерь после шумового скачка
-                        if not self.loss_suppressed:
-                            print(f"⚠️ Шумовой скачок seq prev={self.last_packet_id} curr={packet_id} (noisy). Учет потерь временно отключен.")
-                        self.loss_suppressed = True
-                        self.consecutive_ok = 0
+                                print("ℹ️ Получен текст до бинарных пакетов, но не 'AUDIO_STREAM' — пропускаем")
+                                self.header_done = True  # чтобы не застрять
+                        except Exception as e:
+                            print(f"⚠️ Ошибка парсинга заголовка: {e}")
+                            self.header_done = True  # не повторять
                     else:
-                        if missed == 0:
-                            self.consecutive_ok += 1
+                        # ждём пока придёт полный заголовок или сразу начнётся бинарный поток
+                        # ограничим размер ожидаемого пролога
+                        if len(self.recv_buffer) > 2048:
+                            print("⚠️ Слишком длинный пролог без разделителя, сбрасываю")
+                            self.recv_buffer = b''
+                        continue
+                # После обработки (или отсутствия) заголовка синхронизируемся по magic
+                if self.last_stream_seq is None:
+                    # Строгий поиск нового или legacy magic – без raw fallback
+                    magic_new_le = STREAM_MAGIC_NEW.to_bytes(4, 'little')
+                    magic_old_le = STREAM_MAGIC_OLD.to_bytes(4, 'little')
+                    pos_new = self.recv_buffer.find(magic_new_le)
+                    pos_old = self.recv_buffer.find(magic_old_le) if self.accept_legacy_magic else -1
+
+                    chosen_magic = None
+                    pos = -1
+                    if pos_new != -1 and (pos_old == -1 or pos_new < pos_old):
+                        chosen_magic = STREAM_MAGIC_NEW
+                        pos = pos_new
+                    elif pos_old != -1:
+                        chosen_magic = STREAM_MAGIC_OLD
+                        pos = pos_old
+
+                    if chosen_magic is None:
+                        # ограничиваем рост буфера
+                        if len(self.recv_buffer) > 4096:
+                            self.recv_buffer = self.recv_buffer[-4096:]
+                        continue
+                    if pos > 0:
+                        print(f"ℹ️ Отбрасываем {pos} байт до первого magic (возможно остаток ASCII заголовка)")
+                        self.recv_buffer = self.recv_buffer[pos:]
+                    # Зафиксируем используемый magic
+                    if chosen_magic == STREAM_MAGIC_OLD:
+                        print("⚠️ Используется legacy magic от прошивки (0x41554448). После обновления прошивки будет ожидаться новый 0x48445541.")
+                    else:
+                        print("✅ Найден новый magic (0x48445541).")
+                        self.accept_legacy_magic = False
+                    # Продолжаем – дальнейший разбор произойдет ниже в цикле пакетов
+
+                # Разбираем буфер: header + payload
+                while True:
+                    if len(self.recv_buffer) < STREAM_HEADER_SIZE:
+                        break  # ждём больше данных
+
+                    # Peek header
+                    header_bytes = self.recv_buffer[:STREAM_HEADER_SIZE]
+                    magic, seq, ts_us, payload_len, codec = STREAM_HEADER_STRUCT.unpack(header_bytes)
+
+                    if self.last_stream_seq is None:
+                        print(f"✅ Синхронизация: magic=0x{magic:08X} bytes=[{magic_bytes_le(magic)}]")
+                        # После первой синхронизации считаем, что payload CVSD = PCM
+                        self.raw_assume_pcm = True
+
+                    if not (magic == STREAM_MAGIC_NEW or (self.accept_legacy_magic and magic == STREAM_MAGIC_OLD)):
+                        # Попытка ресинхронизации: сдвигаем на 1 байт
+                        print(f"⚠️ Desync (magic=0x{magic:08X} != (0x{STREAM_MAGIC_NEW:08X} / 0x{STREAM_MAGIC_OLD:08X})), resync...")
+                        self.recv_buffer = self.recv_buffer[1:]
+                        continue
+
+                    total_needed = STREAM_HEADER_SIZE + payload_len
+                    if len(self.recv_buffer) < total_needed:
+                        # ждём оставшиеся байты payload
+                        break
+
+                    # Извлекаем пакет целиком
+                    packet = self.recv_buffer[:total_needed]
+                    self.recv_buffer = self.recv_buffer[total_needed:]
+                    if payload_len == 0 or payload_len > 1024:
+                        print(f"⚠️ Нереалистичный payload_len={payload_len}, пропуск пакета")
+                        continue
+
+                    # Увеличиваем счетчик пакетов
+                    self.total_packets += 1
+                    self.packet_counter += 1
+
+                    # Потери (32-битный seq, wrap учитывается)
+                    if self.last_stream_seq is not None:
+                        expected = (self.last_stream_seq + 1) & 0xFFFFFFFF
+                        if seq != expected:
+                            # вычислим пропуск
+                            diff = (seq - expected) & 0xFFFFFFFF
+                            if diff != 0:
+                                self.missed_packets += diff
+                                print(f"⚠️ Пропуск {diff} пакетов (expected={expected} got={seq})")
+                    self.last_stream_seq = seq
+
+                    # Задержка (прием - метка отправителя)
+                    arrival_us = int(time.time() * 1_000_000)
+                    raw_delta_us = arrival_us - ts_us
+                    if raw_delta_us < 0 or raw_delta_us > 120_000_000:  # >120s считаем неверной меткой (например из-за несовместимых эпох)
+                        net_delay_ms = -1.0
+                    else:
+                        net_delay_ms = raw_delta_us / 1000.0
+                    if self.total_packets % 200 == 1:
+                        if net_delay_ms >= 0:
+                            print(f"🕒 seq={seq} delay={net_delay_ms:.1f}ms payload={payload_len} codec={codec}")
                         else:
-                            self.consecutive_ok = 0
+                            print(f"🕒 seq={seq} delay=? payload={payload_len} codec={codec}")
 
-                        if not self.loss_suppressed and valid and missed > 0:
-                            self.missed_packets += missed
-                            print(f"⚠️ Потеря {missed} пакетов (prev={self.last_packet_id} curr={packet_id}{' wrap' if wrapped else ''})")
+                    # Проверка кодека (если поменялся — перенастроим аудио при необходимости)
+                    if codec == STREAM_CODEC_MSBC and not getattr(self, 'is_msbc', False):
+                        print("🔁 Переключение в mSBC (16 kHz)")
+                        self.is_msbc = True
+                        self.sample_rate = 16000
+                        self.init_audio_stream()
+                    elif codec == STREAM_CODEC_CVSD and getattr(self, 'is_msbc', False):
+                        print("🔁 Переключение в CVSD (8 kHz)")
+                        self.is_msbc = False
+                        self.sample_rate = 8000
+                        self.init_audio_stream()
 
-                        # Попытка восстановить учет после подавления
-                        if self.loss_suppressed and self.consecutive_ok >= RECOVER_MIN_CONSECUTIVE_OK:
-                            self.loss_suppressed = False
-                            print(f"✅ Учет потерь восстановлен после {self.consecutive_ok} стабильных пакетов.")
-
-                    # Обновляем last_packet_id если пакет адекватен
-                    if self.last_packet_id is None or ((packet_id - self.last_packet_id) & 0xFFFFFFFF) != 0:
-                        self.last_packet_id = packet_id
-
-                # Обработка данных
-                processed_data = self.process_audio_data(data[8:], seq=packet_id)
-                if processed_data is None:
-                    continue
-
-                try:
-                    self.audio_queue.put_nowait(processed_data)
-                except queue.Full:
-                    self.dropped_packets += 1
-                    print(f"⚠️ Очередь переполнена: сброшено {self.dropped_packets} пакетов")
+                    payload = packet[STREAM_HEADER_SIZE:]
+                    # Трактуем CVSD payload как уже готовый PCM (ESP шлет PCM 16-bit)
+                    if codec == STREAM_CODEC_CVSD:
+                        decoded_pcm = payload
+                    elif codec == STREAM_CODEC_MSBC:
+                        decoded_pcm = self.msbc_decoder.decode(payload)
+                    else:
+                        decoded_pcm = None
+                    if not decoded_pcm:
+                        continue
+                    if self.stream is None:
+                        # Инициализируем поток исходя из текущих параметров (sample_rate может обновляться при переключении кодека)
+                        self.init_audio_stream()
+                    processed = self.process_audio_data(decoded_pcm, seq=seq)
+                    if processed is None:
+                        continue
+                    try:
+                        self.audio_queue.put_nowait(processed)
+                    except queue.Full:
+                        self.dropped_packets += 1
+                        if (self.dropped_packets % 50) == 1:
+                            print(f"⚠️ Очередь переполнена: сброшено {self.dropped_packets} пакетов")
 
             except Exception as e:
                 print(f"❌ Ошибка приема данных: {e}")
                 break
 
-    def process_audio_data(self, data, seq=None):
-        """Обработка и конвертация аудио данных"""
+    def process_audio_data(self, pcm_bytes, seq=None):
+        """Обработка уже декодированных PCM s16le аудио данных"""
         try:
-            audio_array = np.frombuffer(data, dtype=np.int16)
-
-            if len(audio_array) > 0:
-                self.packet_counter += 1
-                max_val = np.max(np.abs(audio_array))
-                avg_val = np.mean(np.abs(audio_array))
-                rms_val = np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))
-
-                if max_val == 0 and avg_val == 0.0:
-                    # подавляем спам: показываем каждый 20-й пустой пакет
-                    if (self.packet_counter % 20) == 1:
-                        if seq is not None:
-                            print(f"⚠️ Пустой аудио пакет #{self.packet_counter} seq={seq}")
-                        else:
-                            print(f"⚠️ Пустой аудио пакет #{self.packet_counter}")
-                    self.log_file.write(f"[WARN] Пустой аудио пакет #{self.packet_counter}\n")
-                    self.log_file.flush()
-
-                if max_val > 30000:
-                    if seq is not None:
-                        print(f"⚠️ Аномально громкий пакет #{self.packet_counter}: seq={seq} max={max_val}")
-                    else:
-                        print(f"⚠️ Аномально громкий пакет #{self.packet_counter}: max={max_val}")
-                    self.log_file.write(f"[WARN] Аномально громкий пакет #{self.packet_counter} max={max_val}\n")
-                    self.log_file.flush()
-
-                # легкая нормализация уровня (автоматический gain) — опционально
-                if rms_val > 0 and rms_val < 500:
-                    gain = min(4.0, 500.0 / rms_val)
-                    audio_array = np.clip(audio_array.astype(np.float32) * gain, -32768, 32767).astype(np.int16)
-
-                # Если учет подавлен, можем пометить редкие пакеты для отладки (каждый 500-й)
-                if self.loss_suppressed and (self.packet_counter % 500) == 1 and seq is not None:
-                    print(f"🔍 DEBUG while suppressed: seq={seq} max={max_val} rms={rms_val:.1f}")
-
-                return audio_array.tobytes()
-            else:
+            if not pcm_bytes:
+                return None
+            audio_array = np.frombuffer(pcm_bytes, dtype=np.int16)
+            if audio_array.size == 0:
                 return None
 
+            # Если очередь близка к заполнению, пропускаем AGC чтобы ускориться
+            if self.audio_queue.qsize() > (self.audio_queue.maxsize * 0.85):
+                return pcm_bytes
+
+            # self.packet_counter += 1  # Удалено: теперь счетчик инкрементируется только в receive_audio_data
+            max_val = int(np.max(np.abs(audio_array)))
+            avg_val = float(np.mean(np.abs(audio_array)))
+            rms_val = float(np.sqrt(np.mean(audio_array.astype(np.float32) ** 2)))
+
+            # Диагностика пустых / почти пустых пакетов
+            if max_val == 0 and avg_val == 0.0:
+                if (self.packet_counter % 20) == 1:
+                    if seq is not None:
+                        print(f"⚠️ Пустой аудио пакет #{self.packet_counter} seq={seq}")
+                    else:
+                        print(f"⚠️ Пустой аудио пакет #{self.packet_counter}")
+                self.log_file.write(f"[WARN] Пустой аудио пакет #{self.packet_counter}\n")
+                self.log_file.flush()
+
+            # Предупреждение о клиппинге
+            if max_val > 32000:
+                if seq is not None:
+                    print(f"⚠️ Аномально громкий пакет #{self.packet_counter}: seq={seq} max={max_val}")
+                else:
+                    print(f"⚠️ Аномально громкий пакет #{self.packet_counter}: max={max_val}")
+                self.log_file.write(f"[WARN] Loud packet #{self.packet_counter} max={max_val}\n")
+                self.log_file.flush()
+
+            # Легкая нормализация (AGC)
+            if 0 < rms_val < 800:
+                gain = min(4.0, 500.0 / rms_val)
+                audio_array = np.clip(audio_array.astype(np.float32) * gain, -32768, 32767).astype(np.int16)
+
+            return audio_array.tobytes()
         except Exception as e:
-            print(f"❌ Ошибка обработки аудио данных: {e}")
+            print(f"❌ Ошибка обработки PCM: {e}")
             return None
 
     def audio_playback_thread(self):
@@ -799,15 +868,7 @@ class AudioServer:
 
     def stop(self):
         """Остановка сервера"""
-        print(f"\n📊 Статистика: получено={self.total_packets}, сброшено={self.dropped_packets}, пропущено={self.missed_packets}, out_of_order={self.out_of_order_packets}, duplicate/ignored≈{self.total_packets - self.missed_packets}")
-        print(f"ℹ️ Шумовых скачков (noisy jumps): {self.noisy_jumps}, учет подавлен сейчас: {self.loss_suppressed}")
-        if self.seq_analyzer.format_determined:
-            if self.seq_analyzer.unreliable:
-                print("ℹ️ Итог: поле счетчика распознано как ненадежное.")
-            else:
-                print(f"ℹ️ Итог: использован {'16' if self.seq_analyzer.use_masked_16 else '32'}-бит {self.seq_analyzer.endian}-endian счетчик для расчета потерь.")
-        else:
-            print("ℹ️ Итог: формат счетчика не был определен до остановки.")
+        print(f"\n📊 Статистика: получено={self.total_packets}, сброшено={self.dropped_packets}, пропущено={self.missed_packets}")
         self.running = False
 
     def cleanup(self):

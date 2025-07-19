@@ -138,6 +138,24 @@ static SemaphoreHandle_t s_send_data_Semaphore = NULL;
 static TaskHandle_t s_bt_app_send_data_task_handler = NULL;
 static esp_hf_audio_state_t s_audio_code;
 
+// ---- Custom packet header for streaming (sequence + timestamp) ----
+// This header is prepended (in little-endian format) before each audio payload
+// sent to the server to help detect packet loss, reordering, and jitter.
+// Server side must read this header (sizeof(stream_packet_header_t)) and then
+// the raw audio payload that follows.
+typedef struct __attribute__((packed)) {
+    uint32_t magic;        // Magic marker to validate packet boundary (e.g. 0x41554448 'AUDH')
+    uint32_t seq;          // Monotonic increasing sequence number
+    uint64_t timestamp_us; // esp_timer_get_time() when packet was captured (microseconds)
+    uint16_t payload_len;  // Length in bytes of the following audio payload
+    uint16_t codec;        // 1 = CVSD, 2 = mSBC (extend as needed)
+} stream_packet_header_t;
+
+static uint32_t s_stream_seq = 0;
+#define STREAM_PACKET_MAGIC 0x41554448u  // 'A''U''D''H'
+#define STREAM_CODEC_CVSD   1
+#define STREAM_CODEC_MSBC   2
+
 // Переменные для мониторинга уровня сигнала
 static bool s_mic_level_monitoring = false;
 static int s_mic_level_samples = 0;
@@ -274,6 +292,10 @@ static void bt_app_hf_incoming_cb(const uint8_t *buf, uint32_t sz)
                 buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
     }
 
+    if (packet_counter == 1) {
+        ESP_LOGI(BT_HF_TAG, "Packet header size=%u bytes (magic=0x%08"PRIx32")", (unsigned)sizeof(stream_packet_header_t), (unsigned long)STREAM_PACKET_MAGIC);
+    }
+
     s_time_new = esp_timer_get_time();
     s_data_num += sz;
 
@@ -289,8 +311,30 @@ static void bt_app_hf_incoming_cb(const uint8_t *buf, uint32_t sz)
         return;
     }
 
-    // Отправляем аудиоданные на сервер
-    esp_err_t stream_result = audio_streaming_send(buf, sz);
+    // Формируем пакет с заголовком (sequence + timestamp) перед отправкой
+    // Header + payload layout: [stream_packet_header_t][audio bytes...]
+    stream_packet_header_t header;
+    header.magic        = STREAM_PACKET_MAGIC;
+    header.seq          = s_stream_seq++;
+    header.timestamp_us = esp_timer_get_time();
+    header.payload_len  = (uint16_t)sz;
+    header.codec        = (s_audio_code == ESP_HF_AUDIO_STATE_CONNECTED_MSBC) ? STREAM_CODEC_MSBC : STREAM_CODEC_CVSD;
+
+    size_t packet_size = sizeof(header) + sz;
+    uint8_t *packet = (uint8_t *)osi_malloc(packet_size);
+    if (!packet) {
+        failed_sends++;
+        if (packet_counter % 100 == 1) {
+            ESP_LOGE(BT_HF_TAG, "❌ OOM allocating packet (%u bytes), drops=%"PRIu32, (unsigned)packet_size, failed_sends);
+        }
+        return;
+    }
+    memcpy(packet, &header, sizeof(header));
+    memcpy(packet + sizeof(header), buf, sz);
+
+    esp_err_t stream_result = audio_streaming_send(packet, packet_size);
+    osi_free(packet);
+
     if (stream_result != ESP_OK) {
         failed_sends++;
         if (packet_counter % 100 == 1) {
@@ -298,7 +342,8 @@ static void bt_app_hf_incoming_cb(const uint8_t *buf, uint32_t sz)
                      esp_err_to_name(stream_result), failed_sends);
         }
     } else if (packet_counter % 200 == 1) {
-        ESP_LOGI(BT_HF_TAG, "✅ Audio streaming: packet #%"PRIu32" sent successfully", packet_counter);
+        ESP_LOGI(BT_HF_TAG, "✅ Audio streaming: packet #%"PRIu32" (seq=%"PRIu32") sent, payload=%"PRIu32" bytes",
+                 packet_counter, header.seq, sz);
     }
 
     if ((s_time_new - s_time_old) >= 3000000) {
@@ -426,6 +471,8 @@ void bt_app_send_data(void)
 void bt_app_send_data_shut_down(void)
 {
     ESP_LOGI(BT_HF_TAG, "Shutting down audio data transmission...");
+
+    s_stream_seq = 0; // Reset sequence for next session
 
     // Останавливаем мониторинг микрофона
     bt_app_stop_mic_level_monitoring();
