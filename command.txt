@@ -1,0 +1,12 @@
+wifi_connect Keenetic-6786 9811992776
+
+stream_init 192.168.1.169 8888
+
+wifi_connect Keenetic-6786 9811992776
+
+
+con BC:F2:92:AE:91:F0
+
+call_start
+
+stream_start
