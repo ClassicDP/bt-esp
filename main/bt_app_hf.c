@@ -423,57 +423,85 @@ static void bt_app_send_data_task(void *arg)
     size_t item_size = 0;
     uint8_t *buf = NULL;
 
-    // Уменьшаем активность исходящей задачи для фокуса на входящих данных
+    // Улучшенный контроль потока для предотвращения гапов
     static int send_counter = 0;
+    static int consecutive_failures = 0;
+    static uint64_t last_successful_send = 0;
+    static uint64_t last_frame_time = 0;
 
     for (;;) {
         if (xSemaphoreTake(s_send_data_Semaphore, (TickType_t)portMAX_DELAY)) {
             send_counter++;
 
-            // Ранее мы пропускали 9 из 10 итераций; для снижения задержки убрано.
-            // (Можно вернуть условие при перегрузке ЦП.)
-
-            s_now_enter_time = esp_timer_get_time();
-            s_us_duration = s_now_enter_time - s_last_enter_time;
-            if(s_audio_code == ESP_HF_AUDIO_STATE_CONNECTED_MSBC) {
-            // time of a frame is 7.5ms, sample is 120, data is 2 (byte/sample), so a frame is 240 byte (HF_SBC_ENC_RAW_DATA_SIZE)
-                frame_data_num = s_us_duration / PCM_BLOCK_DURATION_US * WBS_PCM_INPUT_DATA_SIZE;
-                s_last_enter_time += frame_data_num / WBS_PCM_INPUT_DATA_SIZE * PCM_BLOCK_DURATION_US;
-            } else {
-                frame_data_num = s_us_duration / PCM_BLOCK_DURATION_US * PCM_INPUT_DATA_SIZE;
-                s_last_enter_time += frame_data_num / PCM_INPUT_DATA_SIZE * PCM_BLOCK_DURATION_US;
-            }
-            if (frame_data_num == 0) {
+            // Проверяем состояние аудио соединения
+            if (s_audio_code != ESP_HF_AUDIO_STATE_CONNECTED &&
+                s_audio_code != ESP_HF_AUDIO_STATE_CONNECTED_MSBC) {
                 continue;
             }
 
-            // Не уменьшаем frame_data_num, передаём полный блок для предсказуемого тайминга
-            // (Возможна оптимизация CPU → вернуть деление при необходимости.)
+            s_now_enter_time = esp_timer_get_time();
+            s_us_duration = s_now_enter_time - s_last_enter_time;
+
+            // Стабилизируем тайминг - принудительно используем фиксированные интервалы
+            uint64_t target_interval = PCM_BLOCK_DURATION_US; // 7500 мкс = 7.5мс
+            if (last_frame_time != 0) {
+                uint64_t time_since_last = s_now_enter_time - last_frame_time;
+                if (time_since_last < target_interval) {
+                    // Слишком рано - пропускаем этот кадр
+                    continue;
+                }
+            }
+            last_frame_time = s_now_enter_time;
+
+            // Рассчитываем размер кадра более консервативно
+            if(s_audio_code == ESP_HF_AUDIO_STATE_CONNECTED_MSBC) {
+                frame_data_num = WBS_PCM_INPUT_DATA_SIZE; // Фиксированный размер
+                s_last_enter_time = s_now_enter_time;
+            } else {
+                frame_data_num = PCM_INPUT_DATA_SIZE; // Фиксированный размер
+                s_last_enter_time = s_now_enter_time;
+            }
+
+            // Снижаем приоритет исходящих данных при частых ошибках
+            if (consecutive_failures > 3) {
+                // Пропускаем каждый второй кадр при ошибках
+                if (send_counter % 2 == 0) {
+                    consecutive_failures = 0; // Сброс для предотвращения накопления
+                    continue;
+                }
+            }
 
             buf = osi_malloc(frame_data_num);
             if (!buf) {
                 ESP_LOGE(BT_HF_TAG, "%s, no mem", __FUNCTION__);
+                consecutive_failures++;
                 continue;
             }
+
             bt_app_hf_create_audio_data(buf, frame_data_num);
-            BaseType_t done = xRingbufferSend(s_m_rb, buf, frame_data_num, pdMS_TO_TICKS(10)); // Добавляем timeout
+
+            // Используем очень короткий таймаут для ring buffer
+            BaseType_t done = xRingbufferSend(s_m_rb, buf, frame_data_num, pdMS_TO_TICKS(1));
             if (!done) {
-                // Не логируем ошибки так часто
-                if (send_counter % 50 == 0) {
-                    ESP_LOGW(BT_HF_TAG, "rb send fail (reduced logging)");
+                consecutive_failures++;
+                if (send_counter % 20 == 0) { // Реже логируем
+                    ESP_LOGW(BT_HF_TAG, "rb send fail, consecutive failures: %d", consecutive_failures);
                 }
+            } else {
+                consecutive_failures = 0;
+                last_successful_send = esp_timer_get_time();
             }
+
             osi_free(buf);
             vRingbufferGetInfo(s_m_rb, NULL, NULL, NULL, NULL, &item_size);
 
-            if(s_audio_code == ESP_HF_AUDIO_STATE_CONNECTED_MSBC) {
-                if(item_size >= WBS_PCM_INPUT_DATA_SIZE) { // Полный блок для отправки
-                    esp_hf_ag_outgoing_data_ready();
-                }
-            } else {
-                if(item_size >= PCM_INPUT_DATA_SIZE) { // Полный блок
-                    esp_hf_ag_outgoing_data_ready();
-                }
+            // Более консервативная проверка размера буфера
+            size_t required_size = (s_audio_code == ESP_HF_AUDIO_STATE_CONNECTED_MSBC) ?
+                                  WBS_PCM_INPUT_DATA_SIZE : PCM_INPUT_DATA_SIZE;
+
+            // Отправляем данные только если буфер не переполнен
+            if(item_size >= required_size && item_size < (required_size * 3)) {
+                esp_hf_ag_outgoing_data_ready();
             }
         }
     }
@@ -481,17 +509,17 @@ static void bt_app_send_data_task(void *arg)
 void bt_app_send_data(void)
 {
     s_send_data_Semaphore = xSemaphoreCreateBinary();
-    xTaskCreate(bt_app_send_data_task, "BtAppSendDataTask", 4096, NULL, configMAX_PRIORITIES - 3, &s_bt_app_send_data_task_handler); // Увеличиваем стек
-    s_m_rb = xRingbufferCreate(ESP_HFP_RINGBUF_SIZE * 2, RINGBUF_TYPE_BYTEBUF); // Увеличиваем размер буфера
+    xTaskCreate(bt_app_send_data_task, "BtAppSendDataTask", 6144, NULL, configMAX_PRIORITIES - 4, &s_bt_app_send_data_task_handler);
+    s_m_rb = xRingbufferCreate(ESP_HFP_RINGBUF_SIZE, RINGBUF_TYPE_BYTEBUF);
     const esp_timer_create_args_t c_periodic_timer_args = {
             .callback = &bt_app_send_data_timer_cb,
             .name = "periodic"
     };
     ESP_ERROR_CHECK(esp_timer_create(&c_periodic_timer_args, &s_periodic_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(s_periodic_timer, PCM_GENERATOR_TICK_US));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(s_periodic_timer, PCM_GENERATOR_TICK_US)); // Возвращаем оригинальный интервал 4ms
     s_last_enter_time = esp_timer_get_time();
 
-    ESP_LOGI(BT_HF_TAG, "✅ Audio send data task initialized with larger buffers");
+    ESP_LOGI(BT_HF_TAG, "✅ Audio send data task initialized with optimized low-latency settings");
     return;
 }
 

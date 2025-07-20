@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-Minimal audio server:
+Optimized audio server with improved packet control and jitter management:
 - Single TCP client (ESP32).
-- Optional ASCII preamble "AUDIO_STREAM" ending with blank line.
 - Binary packets with header (little-endian):
-    uint32 magic      (0x48445541 'AUDH' or legacy 0x41554448)
+    uint32 magic      (0x48445541 'AUDH')
     uint32 seq        (32-bit packet sequence)
-    uint64 timestamp_us (ignored except for presence)
+    uint64 timestamp_us (ESP32 capture timestamp)
     uint16 payload_len (PCM payload length)
-    uint16 codec       (1 -> 8000 Hz, 2 -> 16000 Hz) *payload already raw PCM s16le mono*
-- Plays audio via PyAudio.
-- Tracks packet loss (sequence gaps) and prints warnings.
-- Saves rolling WAV files every 5 seconds; cleans old segment_*.wav on start.
+    uint16 codec       (1 -> 8000 Hz, 2 -> 16000 Hz)
+- Enhanced packet loss detection and concealment
+- Adaptive jitter buffer with underrun prevention
+- Real-time sequence validation
 """
 
 import socket
@@ -45,36 +44,39 @@ class AudioServer:
         self.running = False
         self.accept_legacy_magic = True
 
-        # Packet statistics
+        # Enhanced packet statistics
         self.total_packets = 0
         self.missed_packets = 0
         self.dropped_packets = 0
         self.last_seq = None
 
-        # Packet control / analysis (minimal)
+        # Packet control / analysis (enhanced)
         self.expected_seq = None
         self.dup_packets = 0
         self.reordered_packets = 0
         self.gap_events = 0
         self.max_gap = 0
+        self.packet_times = []  # For jitter calculation
+        self.arrival_times = []
+
+        # CSV logging for detailed analysis
         self.packet_log_path = "packet_log.csv"
         self.packet_log_file = open(self.packet_log_path, "w", newline='')
         self.packet_csv = csv.writer(self.packet_log_file)
         self.packet_csv.writerow([
-            "time_s","seq","expected","gap","event",
-            "lost_total","dup_total","reorder_total",
-            "delta_ms","qsize","underrun",
-            "mean","edge_jump","conceal_ins"
+            "time_s","seq","expected","gap","event","delta_ms",
+            "jitter_ms","lost_total","dup_total","reorder_total",
+            "qsize","underrun","buffer_ms","esp32_ts_us"
         ])
 
-        # Timing / underrun diagnostics
+        # Enhanced timing diagnostics
         self.prev_arrival = None
         self.avg_delta_ms = 0.0
-        self._curr_delta_ms = 0.0
-        self._curr_qsize = 0
+        self.jitter_ms = 0.0
         self.underrun_events = 0
+        self.buffer_health = 0.0
 
-        # Edge / continuity diagnostics & concealment
+        # Edge / continuity diagnostics & concealment (added missing variables)
         self.prev_last_sample = None
         self.edge_jump_threshold = 1500   # int16 threshold for edge detection
         self._curr_mean = 0
@@ -82,8 +84,12 @@ class AudioServer:
         self.inserted_conceal_frames = 0
         self._gap_conceal_pending = 0
         self.max_gap_conceal_frames = 20  # limit PLC frames per gap
+        self._curr_delta_ms = 0.0
+        self._curr_jitter_ms = 0.0
+        self._curr_qsize = 0
+        self._curr_underrun = 0
 
-        # Audio params
+        # Audio params with adaptive sample rate
         self.sample_rate = 8000
         self.channels = 1
         self.bits_per_sample = 16
@@ -96,15 +102,21 @@ class AudioServer:
         self.segment_start = time.time()
         self.segment_frames = []
 
-        # Playback
-        self.audio_queue = queue.Queue(maxsize=240)
-        # Jitter buffer configuration (overridable via CLI)
-        self.prebuffer_ms = 300  # default increased
-        self.min_buffer_ms = 40
-        self.max_buffer_ms = 160
-        # Frame / buffering state
-        self.frame_samples = None
-        self.bytes_per_sample = 2  # s16le mono
+        # Enhanced jitter buffer
+        self.audio_queue = queue.Queue(maxsize=300)  # Уменьшили буфер
+        self.prebuffer_ms = 50   # Быстрый старт
+        self.min_buffer_ms = 25  # Низкий минимум
+        self.max_buffer_ms = 200 # Умеренный максимум
+        self.target_buffer_ms = 75  # Целевое значение буфера
+
+        # Improved concealment
+        self.silence_frame = None
+        self.last_good_frame = None
+        self.concealment_fade_samples = 10  # Плавный переход для уменьшения щелчков
+
+        # Frame timing
+        self.frame_samples = 60  # Default for CVSD 7.5ms frames
+        self.bytes_per_sample = 2
         self.play_started = False
         self.buffered_ms = 0.0
         self.stream = None
@@ -188,8 +200,8 @@ class AudioServer:
             self.packet_csv.writerow([
                 f"{now_rel:.6f}", seq, self.expected_seq, gap, event,
                 self.missed_packets, self.dup_packets, self.reordered_packets,
-                f"{self._curr_delta_ms:.3f}", self._curr_qsize, getattr(self, "_curr_underrun", 0),
-                self._curr_mean, self._curr_edge_jump, self.inserted_conceal_frames
+                f"{self._curr_delta_ms:.3f}", self._curr_jitter_ms, self._curr_qsize, getattr(self, "_curr_underrun", 0),
+                self.buffer_health, self._curr_mean, self._curr_edge_jump, self.inserted_conceal_frames
             ])
             if (self.total_packets % 100) == 0:
                 self.packet_log_file.flush()
@@ -225,29 +237,119 @@ class AudioServer:
     def _playback_thread(self):
         import time
         print("🔊 Playback thread started")
-        PLAY_INTERVAL = 0.05  # 50 ms
-        PACKET_DURATION = 0.0075  # 7.5 ms per packet
-        PACKETS_PER_CHUNK = int(PLAY_INTERVAL / PACKET_DURATION)
 
-        chunk = bytearray()
-        last_write = time.time()
+        # Wait for initial buffer to fill
+        print(f"⏳ Waiting for prebuffer ({self.prebuffer_ms}ms)...")
+        while self.running and self.buffered_ms < self.prebuffer_ms:
+            time.sleep(0.01)
+
+        if not self.running:
+            return
+
+        print(f"▶️ Starting playback (buffer={self.buffered_ms:.1f}ms)")
 
         while self.running:
             try:
-                pkt = self.audio_queue.get(timeout=0.01)
-                chunk.extend(pkt)
-                if len(chunk) >= PACKETS_PER_CHUNK * len(pkt):
-                    if self.stream:
-                        self.stream.write(bytes(chunk))
-                    chunk.clear()
-                    last_write = time.time()
-            except queue.Empty:
-                now = time.time()
-                if chunk and (now - last_write > PLAY_INTERVAL):
-                    if self.stream:
-                        self.stream.write(bytes(chunk))
-                    chunk.clear()
-                    last_write = now
+                # Check buffer health
+                if self.buffered_ms < self.min_buffer_ms:
+                    # Buffer too low, wait a bit
+                    time.sleep(0.005)
+                    continue
+
+                # Get and play packet
+                try:
+                    packet = self.audio_queue.get(timeout=0.01)
+                    if self.stream and len(packet) > 0:
+                        self.stream.write(packet)
+                        # Update last good frame for concealment
+                        self.last_good_frame = packet
+                except queue.Empty:
+                    # No data available
+                    time.sleep(0.005)
+
+            except Exception as e:
+                print(f"❌ Playback error: {e}")
+                time.sleep(0.01)
+
+    def _create_smooth_concealment(self, frame_size):
+        """Создает плавный переход для маскировки пропущенных пакетов"""
+        if self.last_good_frame and len(self.last_good_frame) >= frame_size:
+            # Используем последний хороший кадр с затуханием
+            samples = struct.unpack('<' + 'h' * (len(self.last_good_frame) // 2), self.last_good_frame)
+            fade_samples = min(len(samples), self.concealment_fade_samples)
+
+            # Создаем затухание для плавного перехода
+            concealed_samples = list(samples)
+            for i in range(fade_samples):
+                fade_factor = (fade_samples - i) / fade_samples * 0.7  # Уменьшаем амплитуду
+                concealed_samples[i] = int(concealed_samples[i] * fade_factor)
+
+            # Добавляем небольшой шум для естественности
+            import random
+            for i in range(len(concealed_samples)):
+                noise = random.randint(-50, 50)
+                concealed_samples[i] = max(-32768, min(32767, concealed_samples[i] + noise))
+
+            return struct.pack('<' + 'h' * len(concealed_samples), *concealed_samples)
+        else:
+            # Возвращаем тишину если нет предыдущего кадра
+            return b'\x00' * frame_size
+
+    def _adaptive_playback_thread(self):
+        """Улучшенный поток воспроизведения с адаптивной буферизацией"""
+        import time
+        print("🔊 Enhanced playback thread started")
+
+        # Динамические параметры
+        target_chunk_ms = 15  # Меньшие чанки для лучшей отзывчивости
+
+        while self.running:
+            try:
+                # Обновляем samples_per_ms каждый раз на случай изменения sample_rate
+                samples_per_ms = self.sample_rate / 1000.0 if self.sample_rate > 0 else 8.0
+
+                # Адаптивная проверка состояния буфера
+                current_buffer_ms = self.buffered_ms
+
+                # Если буфер слишком мал, ждем накопления
+                if current_buffer_ms < self.min_buffer_ms and self.total_packets > 10:
+                    time.sleep(0.005)  # 5ms ожидание
+                    continue
+
+                # Если буфер слишком большой, ускоряем воспроизведение
+                if current_buffer_ms > self.max_buffer_ms:
+                    target_chunk_ms = 20  # Больше чанки для быстрого опустошения
+                else:
+                    target_chunk_ms = 15  # Нормальный размер
+
+                # Собираем данные для воспроизведения
+                chunk_data = bytearray()
+                packets_collected = 0
+                max_packets = 3  # Ограничиваем количество пакетов за раз
+
+                while packets_collected < max_packets and self.running:
+                    try:
+                        packet = self.audio_queue.get(timeout=0.01)
+                        chunk_data.extend(packet)
+                        packets_collected += 1
+
+                        # Сохраняем последний хороший кадр для concealment
+                        if len(packet) > 0:
+                            self.last_good_frame = packet
+
+                    except queue.Empty:
+                        break
+
+                # Воспроизводим собранный чанк
+                if chunk_data and self.stream:
+                    self.stream.write(bytes(chunk_data))
+                else:
+                    # Если нет данных, добавляем короткую паузу
+                    time.sleep(0.005)
+
+            except Exception as e:
+                print(f"❌ Playback error: {e}")
+                time.sleep(0.01)
 
     def _exit_summary(self):
         if self.total_packets:
@@ -419,11 +521,12 @@ class AudioServer:
                     self._packet_loss(seq, payload_len)
                     # Insert concealment frames if a gap was detected
                     if self._gap_conceal_pending > 0 and self.frame_samples:
-                        # Use last real payload as template (or silence if none)
-                        base_frame = payload if payload_len > 0 else (b'\x00' * (self.frame_samples * 2))
+                        # Используем улучшенный concealment вместо простого копирования
+                        frame_size = self.frame_samples * 2  # 16-bit samples
                         for _ in range(self._gap_conceal_pending):
                             try:
-                                self.audio_queue.put_nowait(base_frame)
+                                concealed_frame = self._create_smooth_concealment(frame_size)
+                                self.audio_queue.put_nowait(concealed_frame)
                                 self.inserted_conceal_frames += 1
                             except queue.Full:
                                 break

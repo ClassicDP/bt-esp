@@ -25,6 +25,7 @@
 #include "esp_console.h"
 #include "app_hf_msg_set.h"
 #include "wifi_manager.h"
+#include "autostart.h"
 
 #define BT_HF_AG_TAG    "HF_AG_DEMO_MAIN"
 
@@ -148,6 +149,23 @@ void app_main(void)
 
     /* Register commands */
     register_hfp_ag();
+
+    /* Initialize autostart system */
+    ESP_LOGI(BT_HF_AG_TAG, "Initializing autostart system...");
+    ret = autostart_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(BT_HF_AG_TAG, "Failed to initialize autostart: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(BT_HF_AG_TAG, "✅ Autostart system initialized");
+
+        // Добавляем задержку для инициализации всех компонентов
+        vTaskDelay(pdMS_TO_TICKS(2000));
+
+        // Выполняем автозапуск команд
+        ESP_LOGI(BT_HF_AG_TAG, "Executing autostart commands...");
+        autostart_execute();
+    }
+
     printf("\n ==================================================\n");
     printf(" |       Steps to test hfp_ag                     |\n");
     printf(" |                                                |\n");

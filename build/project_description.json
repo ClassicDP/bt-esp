@@ -1,7 +1,7 @@
 {
     "version":            "1.1",
     "project_name":       "hfp_ag",
-    "project_version":    "1",
+    "project_version":    "b45117e-dirty",
     "project_path":       "/Users/dp/Projects/esp/hfp_ag_custom",
     "idf_path":           "/Users/dp/esp/esp-idf",
     "build_dir":          "/Users/dp/Projects/esp/hfp_ag_custom/build",
@@ -805,7 +805,7 @@
             "managed_reqs": [],
             "managed_priv_reqs": [],
             "file": "/Users/dp/Projects/esp/hfp_ag_custom/build/esp-idf/main/libmain.a",
-            "sources": [ "/Users/dp/Projects/esp/hfp_ag_custom/main/app_hf_msg_set.c", "/Users/dp/Projects/esp/hfp_ag_custom/main/audio_streaming.c", "/Users/dp/Projects/esp/hfp_ag_custom/main/bt_app_core.c", "/Users/dp/Projects/esp/hfp_ag_custom/main/bt_app_hf.c", "/Users/dp/Projects/esp/hfp_ag_custom/main/call_simulation.c", "/Users/dp/Projects/esp/hfp_ag_custom/main/gpio_pcm_config.c", "/Users/dp/Projects/esp/hfp_ag_custom/main/main.c", "/Users/dp/Projects/esp/hfp_ag_custom/main/wifi_manager.c" ],
+            "sources": [ "/Users/dp/Projects/esp/hfp_ag_custom/main/app_hf_msg_set.c", "/Users/dp/Projects/esp/hfp_ag_custom/main/audio_streaming.c", "/Users/dp/Projects/esp/hfp_ag_custom/main/autostart.c", "/Users/dp/Projects/esp/hfp_ag_custom/main/bt_app_core.c", "/Users/dp/Projects/esp/hfp_ag_custom/main/bt_app_hf.c", "/Users/dp/Projects/esp/hfp_ag_custom/main/call_simulation.c", "/Users/dp/Projects/esp/hfp_ag_custom/main/gpio_pcm_config.c", "/Users/dp/Projects/esp/hfp_ag_custom/main/main.c", "/Users/dp/Projects/esp/hfp_ag_custom/main/wifi_manager.c" ],
             "include_dirs": [ "." ]
         },
         "mbedtls": {

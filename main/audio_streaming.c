@@ -94,9 +94,9 @@ esp_err_t audio_streaming_start(void)
     );
 
     if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create streaming task");
+        ESP_LOGE(TAG, "Failed to create audio streaming task");
         s_audio_stream.is_running = false;
-        return ESP_ERR_NO_MEM;
+        return ESP_FAIL;
     }
 
     ESP_LOGI(TAG, "Audio streaming started");
@@ -200,6 +200,8 @@ esp_err_t audio_streaming_deinit(void)
 static void audio_streaming_task(void *pvParameters)
 {
     audio_data_t audio_data;
+    int consecutive_failures = 0;
+    TickType_t last_receive_time = 0;
 
     ESP_LOGI(TAG, "Audio streaming task started");
 
@@ -209,28 +211,62 @@ static void audio_streaming_task(void *pvParameters)
             ESP_LOGI(TAG, "Attempting to connect to server...");
             if (connect_to_server() == ESP_OK) {
                 ESP_LOGI(TAG, "Connected to audio server");
+                consecutive_failures = 0;
             } else {
-                ESP_LOGW(TAG, "Failed to connect, retrying in 5 seconds");
-                vTaskDelay(pdMS_TO_TICKS(5000));
+                consecutive_failures++;
+                int delay_ms = (consecutive_failures > 5) ? 5000 : 1000;
+                ESP_LOGW(TAG, "Failed to connect (attempt %d), retrying in %dms", consecutive_failures, delay_ms);
+                vTaskDelay(pdMS_TO_TICKS(delay_ms));
                 continue;
             }
         }
 
-        // Получаем данные из очереди
-        if (xQueueReceive(s_audio_stream.audio_queue, &audio_data, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            // Отправляем данные на сервер
-            int sent = send(s_audio_stream.socket_fd, audio_data.data, audio_data.size, 0);
+        // Получаем данные из очереди с коротким таймаутом для быстрой реакции
+        TickType_t timeout = pdMS_TO_TICKS(100); // Уменьшаем таймаут до 100ms
+        if (xQueueReceive(s_audio_stream.audio_queue, &audio_data, timeout) == pdTRUE) {
+            last_receive_time = xTaskGetTickCount();
+
+            // Отправляем данные на сервер немедленно
+            int sent = send(s_audio_stream.socket_fd, audio_data.data, audio_data.size, MSG_DONTWAIT);
 
             if (sent < 0) {
-                ESP_LOGW(TAG, "Failed to send audio data: %s", strerror(errno));
-                disconnect_from_server();
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // Сокет заблокирован, повторяем отправку с небольшой задержкой
+                    vTaskDelay(pdMS_TO_TICKS(1));
+                    sent = send(s_audio_stream.socket_fd, audio_data.data, audio_data.size, 0);
+                }
+
+                if (sent < 0) {
+                    ESP_LOGW(TAG, "Failed to send audio data: %s", strerror(errno));
+                    disconnect_from_server();
+                    consecutive_failures++;
+                }
             } else if (sent != (int)audio_data.size) {
                 ESP_LOGW(TAG, "Partial send: %d/%"PRIu32" bytes", sent, audio_data.size);
+                consecutive_failures++;
+            } else {
+                // Успешная отправка
+                consecutive_failures = 0;
             }
 
             // Освобождаем память
             free(audio_data.data);
+        } else {
+            // Таймаут получения данных - проверяем состояние соединения
+            TickType_t now = xTaskGetTickCount();
+            if (s_audio_stream.is_connected &&
+                (now - last_receive_time) > pdMS_TO_TICKS(5000)) {
+                ESP_LOGW(TAG, "No data received for 5 seconds, checking connection");
+                // Отправляем keepalive
+                char keepalive = 0;
+                if (send(s_audio_stream.socket_fd, &keepalive, 1, MSG_DONTWAIT) < 0) {
+                    ESP_LOGW(TAG, "Connection lost, will reconnect");
+                    disconnect_from_server();
+                }
+            }
         }
+
+        // Добавляем микро-паузу для предотвращения нагрузки на CPU
     }
 
     disconnect_from_server();

@@ -14,6 +14,7 @@
 #include "esp_log.h"
 #include "call_simulation.h" // Добавляем новый заголовочный файл
 #include "wifi_manager.h"
+#include "autostart.h"
 
 // if you want to connect a specific device, add it's bda here
 esp_bd_addr_t hf_peer_addr = {0xB0, 0xF1, 0xA3, 0x01, 0x2D,0x2E};
@@ -569,6 +570,162 @@ HF_CMD_HANDLER(wifi_status)
     return 0;
 }
 
+// Autostart Management Commands
+
+//Set Autostart Commands
+HF_CMD_HANDLER(autostart_set)
+{
+    if (argn < 2) {
+        printf("Usage: autostart_set <command1> [command2] [...]\n");
+        printf("Example: autostart_set \"wifi_connect MyWiFi password\" \"stream_init 192.168.1.100 8888\" \"stream_start\"\n");
+        printf("Note: Use quotes for commands with spaces\n");
+        return 1;
+    }
+
+    // Создаем массив команд из аргументов
+    const char **commands = malloc((argn - 1) * sizeof(char*));
+    if (!commands) {
+        printf("Failed to allocate memory for commands\n");
+        return 1;
+    }
+
+    for (int i = 1; i < argn; i++) {
+        commands[i - 1] = argv[i];
+    }
+
+    esp_err_t ret = autostart_save_commands(commands, argn - 1);
+    free(commands);
+
+    if (ret == ESP_OK) {
+        printf("✅ Autostart commands saved (%d commands)\n", argn - 1);
+        printf("Commands will be executed on next boot if autostart is enabled\n");
+        for (int i = 1; i < argn; i++) {
+            printf("  %d. %s\n", i, argv[i]);
+        }
+    } else {
+        printf("❌ Failed to save autostart commands: %s\n", esp_err_to_name(ret));
+    }
+
+    return 0;
+}
+
+//Load Default Autostart Commands
+HF_CMD_HANDLER(autostart_load_default)
+{
+    printf("Loading default autostart commands...\n");
+
+    // Команды из вашего файла command.txt
+    const char *default_commands[] = {
+        "wifi_connect Keenetic-6786 9811992776",
+        "stream_init 192.168.1.169 8888",
+        "stream_start"
+    };
+    size_t num_commands = sizeof(default_commands) / sizeof(default_commands[0]);
+
+    esp_err_t ret = autostart_save_commands(default_commands, num_commands);
+
+    if (ret == ESP_OK) {
+        printf("✅ Default autostart commands loaded:\n");
+        for (size_t i = 0; i < num_commands; i++) {
+            printf("  %zu. %s\n", i + 1, default_commands[i]);
+        }
+        printf("Commands will be executed on next boot if autostart is enabled\n");
+    } else {
+        printf("❌ Failed to load default commands: %s\n", esp_err_to_name(ret));
+    }
+
+    return 0;
+}
+
+//Show Autostart Commands
+HF_CMD_HANDLER(autostart_show)
+{
+    printf("📋 Autostart Configuration:\n");
+    printf("Status: %s\n", autostart_is_enabled() ? "✅ Enabled" : "❌ Disabled");
+
+    char **commands = NULL;
+    size_t count = 0;
+    esp_err_t ret = autostart_load_commands(&commands, &count);
+
+    if (ret != ESP_OK) {
+        printf("❌ Failed to load commands: %s\n", esp_err_to_name(ret));
+        return 1;
+    }
+
+    if (count == 0) {
+        printf("Commands: (none configured)\n");
+        printf("💡 Use 'autostart_set' or 'autostart_load_default' to configure commands\n");
+    } else {
+        printf("Commands (%zu configured):\n", count);
+        for (size_t i = 0; i < count; i++) {
+            printf("  %zu. %s\n", i + 1, commands[i]);
+            free(commands[i]);
+        }
+        free(commands);
+    }
+
+    return 0;
+}
+
+//Enable/Disable Autostart
+HF_CMD_HANDLER(autostart_enable)
+{
+    if (argn != 2) {
+        printf("Usage: autostart_enable <0|1>\n");
+        printf("  0 = disable autostart\n");
+        printf("  1 = enable autostart\n");
+        return 1;
+    }
+
+    int enable = atoi(argv[1]);
+    if (enable != 0 && enable != 1) {
+        printf("Invalid argument. Use 0 (disable) or 1 (enable)\n");
+        return 1;
+    }
+
+    esp_err_t ret = autostart_set_enabled(enable != 0);
+    if (ret == ESP_OK) {
+        printf("✅ Autostart %s\n", enable ? "enabled" : "disabled");
+        if (enable) {
+            printf("Commands will be executed automatically on next boot\n");
+        }
+    } else {
+        printf("❌ Failed to update autostart setting: %s\n", esp_err_to_name(ret));
+    }
+
+    return 0;
+}
+
+//Clear Autostart Commands
+HF_CMD_HANDLER(autostart_clear)
+{
+    printf("Clearing autostart commands...\n");
+    esp_err_t ret = autostart_clear();
+
+    if (ret == ESP_OK) {
+        printf("✅ Autostart commands cleared\n");
+        printf("Autostart is now disabled\n");
+    } else {
+        printf("❌ Failed to clear autostart commands: %s\n", esp_err_to_name(ret));
+    }
+
+    return 0;
+}
+
+//Execute Autostart Commands Now
+HF_CMD_HANDLER(autostart_run)
+{
+    printf("🚀 Executing autostart commands now...\n");
+    esp_err_t ret = autostart_execute();
+
+    if (ret == ESP_OK) {
+        printf("✅ Autostart execution completed\n");
+    } else {
+        printf("❌ Autostart execution failed: %s\n", esp_err_to_name(ret));
+    }
+
+    return 0;
+}
 static hf_msg_hdl_t hf_cmd_tbl[] = {
     {"con",          hf_conn_handler},
     {"dis",          hf_disc_handler},
@@ -599,6 +756,12 @@ static hf_msg_hdl_t hf_cmd_tbl[] = {
     {"wifi_connect",  hf_wifi_connect_handler},
     {"wifi_disconnect",hf_wifi_disconnect_handler},
     {"wifi_status",  hf_wifi_status_handler},
+    {"autostart_set", hf_autostart_set_handler},
+    {"autostart_load_default", hf_autostart_load_default_handler},
+    {"autostart_show", hf_autostart_show_handler},
+    {"autostart_enable", hf_autostart_enable_handler},
+    {"autostart_clear", hf_autostart_clear_handler},
+    {"autostart_run", hf_autostart_run_handler},
 };
 
 #define HF_ORDER(name)   name##_cmd
@@ -631,7 +794,13 @@ enum hf_cmd_idx {
     HF_CMD_IDX_STREAM_STATUS, /*Check audio streaming status*/
     HF_CMD_IDX_WIFI_CONNECT,  /*Connect to WiFi*/
     HF_CMD_IDX_WIFI_DISCONNECT, /*Disconnect from WiFi*/
-    HF_CMD_IDX_WIFI_STATUS    /*Check WiFi status*/
+    HF_CMD_IDX_WIFI_STATUS,    /*Check WiFi status*/
+    HF_CMD_IDX_AUTOSTART_SET,  /*Set autostart commands*/
+    HF_CMD_IDX_AUTOSTART_LOAD_DEFAULT, /*Load default autostart commands*/
+    HF_CMD_IDX_AUTOSTART_SHOW,  /*Show autostart commands*/
+    HF_CMD_IDX_AUTOSTART_ENABLE, /*Enable or disable autostart*/
+    HF_CMD_IDX_AUTOSTART_CLEAR,  /*Clear autostart commands*/
+    HF_CMD_IDX_AUTOSTART_RUN    /*Execute autostart commands now*/
 };
 
 static char *hf_cmd_explain[] = {
@@ -664,6 +833,12 @@ static char *hf_cmd_explain[] = {
     "connect to a WiFi network (usage: wifi_connect <ssid> [password])",
     "disconnect from the current WiFi network",
     "check the status of WiFi connection",
+    "set autostart commands (usage: autostart_set <command1> [command2] [...])",
+    "load default autostart commands",
+    "show autostart commands",
+    "enable or disable autostart (usage: autostart_enable <0|1>)",
+    "clear autostart commands",
+    "execute autostart commands now",
 };
 typedef struct {
     struct arg_str *tgt;
@@ -934,4 +1109,52 @@ void register_hfp_ag(void)
             .func = hf_cmd_tbl[HF_CMD_IDX_WIFI_STATUS].handler,
         };
         ESP_ERROR_CHECK(esp_console_cmd_register(&HF_ORDER(wifi_status)));
+
+        const esp_console_cmd_t HF_ORDER(autostart_set) = {
+            .command = "autostart_set",
+            .help = hf_cmd_explain[HF_CMD_IDX_AUTOSTART_SET],
+            .hint = "<command1> [command2] [...]",
+            .func = hf_cmd_tbl[HF_CMD_IDX_AUTOSTART_SET].handler,
+        };
+        ESP_ERROR_CHECK(esp_console_cmd_register(&HF_ORDER(autostart_set)));
+
+        const esp_console_cmd_t HF_ORDER(autostart_load_default) = {
+            .command = "autostart_load_default",
+            .help = hf_cmd_explain[HF_CMD_IDX_AUTOSTART_LOAD_DEFAULT],
+            .hint = NULL,
+            .func = hf_cmd_tbl[HF_CMD_IDX_AUTOSTART_LOAD_DEFAULT].handler,
+        };
+        ESP_ERROR_CHECK(esp_console_cmd_register(&HF_ORDER(autostart_load_default)));
+
+        const esp_console_cmd_t HF_ORDER(autostart_show) = {
+            .command = "autostart_show",
+            .help = hf_cmd_explain[HF_CMD_IDX_AUTOSTART_SHOW],
+            .hint = NULL,
+            .func = hf_cmd_tbl[HF_CMD_IDX_AUTOSTART_SHOW].handler,
+        };
+        ESP_ERROR_CHECK(esp_console_cmd_register(&HF_ORDER(autostart_show)));
+
+        const esp_console_cmd_t HF_ORDER(autostart_enable) = {
+            .command = "autostart_enable",
+            .help = hf_cmd_explain[HF_CMD_IDX_AUTOSTART_ENABLE],
+            .hint = "<0|1>",
+            .func = hf_cmd_tbl[HF_CMD_IDX_AUTOSTART_ENABLE].handler,
+        };
+        ESP_ERROR_CHECK(esp_console_cmd_register(&HF_ORDER(autostart_enable)));
+
+        const esp_console_cmd_t HF_ORDER(autostart_clear) = {
+            .command = "autostart_clear",
+            .help = hf_cmd_explain[HF_CMD_IDX_AUTOSTART_CLEAR],
+            .hint = NULL,
+            .func = hf_cmd_tbl[HF_CMD_IDX_AUTOSTART_CLEAR].handler,
+        };
+        ESP_ERROR_CHECK(esp_console_cmd_register(&HF_ORDER(autostart_clear)));
+
+        const esp_console_cmd_t HF_ORDER(autostart_run) = {
+            .command = "autostart_run",
+            .help = hf_cmd_explain[HF_CMD_IDX_AUTOSTART_RUN],
+            .hint = NULL,
+            .func = hf_cmd_tbl[HF_CMD_IDX_AUTOSTART_RUN].handler,
+        };
+        ESP_ERROR_CHECK(esp_console_cmd_register(&HF_ORDER(autostart_run)));
 }
